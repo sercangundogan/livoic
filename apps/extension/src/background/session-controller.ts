@@ -208,16 +208,8 @@ export class SessionController {
       await this.persist();
     }
 
-    if (event.type === 'transcript.partial') {
-      await sendTabMessage(this.tabId, {
-        type: 'overlay.subtitle',
-        payload: {
-          segmentId: event.segmentId,
-          sourceText: event.text,
-          partial: true,
-        },
-      });
-    }
+    // Do not forward source-language partials to the overlay.
+    // Translation-only UX waits for translation.final to avoid English flashes.
 
     if (event.type === 'translation.final') {
       await sendTabMessage(this.tabId, {

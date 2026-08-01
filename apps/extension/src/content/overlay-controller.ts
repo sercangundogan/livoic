@@ -1,5 +1,11 @@
-import type { SessionStatus, SubtitleBackground, SubtitleMode, SubtitlePosition, SubtitleSize } from '@live-translator/protocol';
-import { formatSubtitleText } from '@live-translator/shared';
+import type {
+  SessionStatus,
+  SubtitleBackground,
+  SubtitleMode,
+  SubtitlePosition,
+  SubtitleSize,
+} from '@live-translator/protocol';
+import { formatSubtitleText, SUBTITLE } from '@live-translator/shared';
 import type { PlayerAdapter } from './player-adapter.js';
 
 type SubtitlePayload = {
@@ -16,6 +22,12 @@ type OverlaySettings = {
   subtitlePosition: SubtitlePosition;
 };
 
+type QueuedCue = {
+  segmentId: string;
+  html: string;
+  displayMs: number;
+};
+
 const SIZE_MAP: Record<SubtitleSize, string> = {
   small: 'clamp(16px, 2.2vw, 22px)',
   medium: 'clamp(20px, 2.8vw, 28px)',
@@ -27,13 +39,16 @@ const POSITION_MAP: Record<SubtitlePosition, string> = {
   medium: '16%',
 };
 
+const FADE_MS = 160;
+const MAX_QUEUE = 4;
+/** When behind, still show each cue briefly so the stream feels live. */
+const CATCH_UP_DISPLAY_MS = 1_400;
+
 export class OverlayController {
   private host: HTMLElement | null = null;
   private shadow: ShadowRoot | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private unobservePlayer?: () => void;
-  private staleTimer?: ReturnType<typeof setTimeout>;
-  private lastFinalSegmentId: string | null = null;
   private settings: OverlaySettings = {
     subtitleMode: 'translation',
     subtitleSize: 'medium',
@@ -41,6 +56,13 @@ export class OverlayController {
     subtitlePosition: 'low',
   };
   private status: SessionStatus = 'idle';
+
+  private queue: QueuedCue[] = [];
+  private playing = false;
+  private currentSegmentId: string | null = null;
+  private advanceTimer?: ReturnType<typeof setTimeout>;
+  private idleTimer?: ReturnType<typeof setTimeout>;
+  private playGeneration = 0;
 
   constructor(private readonly adapter: PlayerAdapter) {}
 
@@ -50,6 +72,10 @@ export class OverlayController {
   }
 
   destroy(): void {
+    this.playGeneration += 1;
+    this.clearTimers();
+    this.queue = [];
+    this.playing = false;
     this.unobservePlayer?.();
     this.resizeObserver?.disconnect();
     this.host?.remove();
@@ -90,61 +116,164 @@ export class OverlayController {
 
   showSubtitle(payload: SubtitlePayload): void {
     this.ensureOverlay();
-    const root = this.shadow?.getElementById('subtitle-root');
-    if (!root) return;
 
+    // Never paint raw source / partial transcripts in translation-first UX.
+    // Partials are source-language drafts and cause the "English flash" problem.
     if (payload.partial && !payload.translatedText) {
-      // Subtle partial source preview
-      root.innerHTML = this.renderLines(
-        formatSubtitleText(payload.sourceText ?? '').lines,
-        true,
-      );
-      this.bumpStaleTimer();
       return;
-    }
-
-    if (payload.segmentId === this.lastFinalSegmentId && !payload.partial) {
-      return;
-    }
-
-    if (!payload.partial) {
-      this.lastFinalSegmentId = payload.segmentId;
     }
 
     const mode = this.settings.subtitleMode;
-    let html = '';
+    const cue = this.buildCue(payload, mode);
+    if (!cue) return;
 
-    if (mode === 'source' && payload.sourceText) {
-      html = this.renderLines(formatSubtitleText(payload.sourceText).lines, false);
-    } else if (mode === 'bilingual') {
-      const source = payload.sourceText
-        ? `<div class="source">${this.renderLines(formatSubtitleText(payload.sourceText, { maxLines: 1 }).lines, true)}</div>`
-        : '';
-      const translation = payload.translatedText
-        ? `<div class="translation">${this.renderLines(formatSubtitleText(payload.translatedText).lines, false)}</div>`
-        : '';
-      html = `${source}${translation}`;
-    } else if (payload.translatedText) {
-      html = this.renderLines(formatSubtitleText(payload.translatedText).lines, false);
+    if (cue.segmentId === this.currentSegmentId) {
+      // Same segment finalized/updated while on screen — refresh in place.
+      void this.renderCue(cue, { immediate: true });
+      return;
     }
 
-    if (html) {
-      root.innerHTML = html;
-      root.style.opacity = '1';
-      this.bumpStaleTimer(formatSubtitleText(payload.translatedText ?? payload.sourceText ?? '').displayMs);
+    const existingIndex = this.queue.findIndex((item) => item.segmentId === cue.segmentId);
+    if (existingIndex >= 0) {
+      this.queue[existingIndex] = cue;
+      return;
+    }
+
+    this.queue.push(cue);
+    while (this.queue.length > MAX_QUEUE) {
+      this.queue.shift();
+    }
+
+    if (!this.playing) {
+      void this.drainQueue();
     }
   }
 
   clear(): void {
+    this.playGeneration += 1;
+    this.clearTimers();
+    this.queue = [];
+    this.playing = false;
+    this.currentSegmentId = null;
     const root = this.shadow?.getElementById('subtitle-root');
     if (root) {
       root.style.opacity = '0';
-      setTimeout(() => {
+      window.setTimeout(() => {
         if (root) root.innerHTML = '';
-      }, 180);
+      }, FADE_MS);
     }
-    this.lastFinalSegmentId = null;
-    if (this.staleTimer) clearTimeout(this.staleTimer);
+  }
+
+  private buildCue(payload: SubtitlePayload, mode: SubtitleMode): QueuedCue | null {
+    if (mode === 'source') {
+      if (!payload.sourceText?.trim()) return null;
+      const formatted = formatSubtitleText(payload.sourceText);
+      return {
+        segmentId: payload.segmentId,
+        html: this.renderLines(formatted.lines, false),
+        displayMs: formatted.displayMs,
+      };
+    }
+
+    if (mode === 'bilingual') {
+      if (!payload.translatedText?.trim()) return null;
+      const translation = formatSubtitleText(payload.translatedText);
+      const source = payload.sourceText
+        ? `<div class="source">${this.renderLines(formatSubtitleText(payload.sourceText, { maxLines: 1 }).lines, false)}</div>`
+        : '';
+      const translated = `<div class="translation">${this.renderLines(translation.lines, false)}</div>`;
+      return {
+        segmentId: payload.segmentId,
+        html: `${source}${translated}`,
+        displayMs: translation.displayMs,
+      };
+    }
+
+    // translation-only (default): never use source text
+    if (!payload.translatedText?.trim()) return null;
+    const formatted = formatSubtitleText(payload.translatedText);
+    return {
+      segmentId: payload.segmentId,
+      html: this.renderLines(formatted.lines, false),
+      displayMs: formatted.displayMs,
+    };
+  }
+
+  private async drainQueue(): Promise<void> {
+    const generation = this.playGeneration;
+    this.playing = true;
+
+    while (generation === this.playGeneration) {
+      const next = this.queue.shift();
+      if (!next) break;
+
+      const backlog = this.queue.length;
+      const displayMs =
+        backlog >= 2
+          ? Math.max(SUBTITLE.minDisplayMs, Math.min(next.displayMs, CATCH_UP_DISPLAY_MS))
+          : Math.max(SUBTITLE.minDisplayMs, Math.min(next.displayMs, SUBTITLE.maxDisplayMs));
+
+      await this.renderCue(next, { immediate: false });
+      if (generation !== this.playGeneration) return;
+
+      await this.wait(displayMs);
+      if (generation !== this.playGeneration) return;
+    }
+
+    this.playing = false;
+    this.scheduleIdleFade();
+  }
+
+  private async renderCue(
+    cue: QueuedCue,
+    options: { immediate: boolean },
+  ): Promise<void> {
+    const root = this.shadow?.getElementById('subtitle-root');
+    if (!root) return;
+
+    this.clearIdleTimer();
+    this.currentSegmentId = cue.segmentId;
+
+    if (options.immediate || !root.innerHTML.trim()) {
+      root.innerHTML = cue.html;
+      root.style.opacity = '1';
+      return;
+    }
+
+    root.style.opacity = '0';
+    await this.wait(FADE_MS);
+    root.innerHTML = cue.html;
+    // Force style flush so the fade-in always runs
+    void root.offsetWidth;
+    root.style.opacity = '1';
+    await this.wait(FADE_MS);
+  }
+
+  private scheduleIdleFade(): void {
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      const root = this.shadow?.getElementById('subtitle-root');
+      if (root && this.queue.length === 0 && !this.playing) {
+        root.style.opacity = '0';
+      }
+    }, SUBTITLE.staleTimeoutMs);
+  }
+
+  private wait(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.advanceTimer = setTimeout(resolve, ms);
+    });
+  }
+
+  private clearTimers(): void {
+    if (this.advanceTimer) clearTimeout(this.advanceTimer);
+    this.advanceTimer = undefined;
+    this.clearIdleTimer();
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
   }
 
   private ensureOverlay(): void {
@@ -156,7 +285,6 @@ export class OverlayController {
       return;
     }
 
-    // Remove any leftover hosts (Twitch remount / SPA navigation)
     document.querySelectorAll('[data-live-translator-overlay]').forEach((el) => el.remove());
 
     const host = document.createElement('div');
@@ -182,8 +310,9 @@ export class OverlayController {
           pointer-events: none;
         }
         #subtitle-root {
-          transition: opacity 180ms ease-out;
+          transition: opacity ${FADE_MS}ms ease-out;
           text-align: center;
+          min-height: 1.35em;
         }
         .line {
           color: #fff;
@@ -195,8 +324,11 @@ export class OverlayController {
             0 0 12px rgba(0,0,0,0.75);
           margin: 0;
         }
-        .line.partial { opacity: 0.55; font-weight: 500; }
-        .source .line { opacity: 0.7; font-size: calc(var(--lt-sub-size, 24px) * 0.78); font-weight: 500; }
+        .source .line {
+          opacity: 0.7;
+          font-size: calc(var(--lt-sub-size, 24px) * 0.78);
+          font-weight: 500;
+        }
         .translation .line { font-weight: 650; }
         .bg-on #subtitle-root {
           background: rgba(0,0,0,0.45);
@@ -216,10 +348,8 @@ export class OverlayController {
           padding: 6px 10px;
           border-radius: 999px;
           border: 1px solid rgba(255,255,255,0.08);
-          transition: opacity 180ms ease-out;
+          transition: opacity ${FADE_MS}ms ease-out;
         }
-        .wrap:hover + #status-pill,
-        #status-pill:hover,
         .controls-hotzone:hover #status-pill {
           opacity: 1;
           pointer-events: auto;
@@ -253,7 +383,6 @@ export class OverlayController {
 
   private syncGeometry(container: HTMLElement): void {
     if (!this.host) return;
-    // Keep host covering the player; fullscreen attaches to video element parent
     const fsElement = document.fullscreenElement;
     if (fsElement instanceof HTMLElement && fsElement !== container && !fsElement.contains(this.host)) {
       if (getComputedStyle(fsElement).position === 'static') {
@@ -275,15 +404,9 @@ export class OverlayController {
   }
 
   private renderLines(lines: string[], partial: boolean): string {
-    return lines.map((line) => `<p class="line${partial ? ' partial' : ''}">${escapeHtml(line)}</p>`).join('');
-  }
-
-  private bumpStaleTimer(displayMs = 5000): void {
-    if (this.staleTimer) clearTimeout(this.staleTimer);
-    this.staleTimer = setTimeout(() => {
-      const root = this.shadow?.getElementById('subtitle-root');
-      if (root) root.style.opacity = '0';
-    }, displayMs);
+    return lines
+      .map((line) => `<p class="line${partial ? ' partial' : ''}">${escapeHtml(line)}</p>`)
+      .join('');
   }
 }
 

@@ -22,9 +22,9 @@ export const SUBTITLE = {
   targetLineLengthMin: 35,
   targetLineLengthMax: 45,
   maxVisibleLines: 2,
-  minDisplayMs: 1_000,
-  maxDisplayMs: 6_000,
-  staleTimeoutMs: 5_000,
+  minDisplayMs: 1_600,
+  maxDisplayMs: 5_500,
+  staleTimeoutMs: 4_000,
   contextHistorySize: 5,
 } as const;
 
