@@ -21,21 +21,24 @@ export class MockSpeechProvider implements SpeechToTextProvider {
   private errorCb?: (error: Error) => void;
   private timer?: ReturnType<typeof setInterval>;
   private audioBytes = 0;
+  /** Absolute stream timeline from first audio byte (aligned with AudioRingBuffer). */
+  private streamBytesTotal = 0;
   private segmentIndex = 0;
-  private startedAt = 0;
   private closed = false;
   private options?: SpeechSessionOptions;
 
   async connect(options: SpeechSessionOptions): Promise<void> {
     this.options = options;
-    this.startedAt = Date.now();
     this.closed = false;
+    this.streamBytesTotal = 0;
+    this.audioBytes = 0;
     this.timer = setInterval(() => this.emitNext(), 2800);
   }
 
   sendAudio(chunk: Buffer): void {
     if (this.closed) return;
     this.audioBytes += chunk.length;
+    this.streamBytesTotal += chunk.length;
   }
 
   onPartial(callback: (event: TranscriptEvent) => void): void {
@@ -61,7 +64,9 @@ export class MockSpeechProvider implements SpeechToTextProvider {
 
     const text = SAMPLE_SEGMENTS[this.segmentIndex % SAMPLE_SEGMENTS.length]!;
     const segmentId = `seg-${this.options?.sessionId.slice(0, 8)}-${this.segmentIndex}`;
-    const elapsed = Date.now() - this.startedAt;
+    const sampleRate = this.options?.sampleRate ?? 16_000;
+    const endMs = Math.floor((this.streamBytesTotal / (sampleRate * 2)) * 1000);
+    const startMs = Math.max(0, endMs - 2200);
     const words = text.split(' ');
 
     const partialText = words.slice(0, Math.ceil(words.length / 2)).join(' ');
@@ -70,7 +75,8 @@ export class MockSpeechProvider implements SpeechToTextProvider {
       text: partialText,
       isFinal: false,
       language: 'en',
-      startMs: elapsed,
+      confidence: 0.95,
+      startMs,
     });
 
     setTimeout(() => {
@@ -80,8 +86,9 @@ export class MockSpeechProvider implements SpeechToTextProvider {
         text,
         isFinal: true,
         language: 'en',
-        startMs: elapsed,
-        endMs: elapsed + 2200,
+        confidence: 0.95,
+        startMs,
+        endMs,
       });
     }, 600);
 

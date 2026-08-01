@@ -145,6 +145,65 @@
       "aliases": ["crafting"]
     }
   ],
+  "phoneticAliases": [
+    {
+      "from": "serious",
+      "to": "Sirus",
+      "requireAnyContext": [
+        "boss",
+        "fight",
+        "fighting",
+        "uber",
+        "awaken",
+        "awakener",
+        "influence",
+        "atlas",
+        "maven",
+        "shaper",
+        "elder",
+        "invite",
+        "sirius",
+        "against"
+      ]
+    },
+    {
+      "from": "sirius",
+      "to": "Sirus",
+      "requireAnyContext": [
+        "boss",
+        "fight",
+        "fighting",
+        "uber",
+        "awaken",
+        "awakener",
+        "influence",
+        "atlas",
+        "maven",
+        "shaper",
+        "elder",
+        "invite",
+        "against"
+      ]
+    },
+    {
+      "from": "mayven",
+      "to": "Maven",
+      "requireAnyContext": ["boss", "fight", "fighting", "invite", "witness", "atlas", "uber"]
+    },
+    {
+      "from": "mavin",
+      "to": "Maven",
+      "requireAnyContext": ["boss", "fight", "fighting", "invite", "witness", "atlas", "uber"]
+    },
+    {
+      "from": "head hunter",
+      "to": "Headhunter"
+    },
+    {
+      "from": "mage blood",
+      "to": "Mageblood"
+    }
+  ],
   "styleRules": [
     "Use natural Turkish PoE community phrasing.",
     "Keep skill gem names in English.",

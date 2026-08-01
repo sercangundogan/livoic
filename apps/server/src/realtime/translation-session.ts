@@ -18,6 +18,17 @@ import type {
   GameTranslationProfile,
   ResolvedGameContext,
 } from '../game-context/types.js';
+import {
+  AudioRingBuffer,
+  createRetranscriber,
+  MockRetranscriber,
+  SessionTranscriptDiagnostics,
+  TranscriptCorrectionService,
+  TranscriptStore,
+  summarizeWordConfidence,
+  type Retranscriber,
+  type TranscriptCorrectionConfig,
+} from '../transcript-correction/index.js';
 
 export type TranslationSessionOptions = {
   sessionId: string;
@@ -28,6 +39,9 @@ export type TranslationSessionOptions = {
   usage: UsageStore;
   logger: Logger;
   gameContext: GameContextService;
+  correction?: TranscriptCorrectionConfig;
+  openaiApiKey?: string;
+  sampleRate?: number;
 };
 
 export class TranslationSession {
@@ -41,6 +55,14 @@ export class TranslationSession {
   private readonly gameContext: GameContextService;
   private readonly context = new ContextManager();
   private readonly memory: TranslationMemory;
+  private readonly correctionConfig: TranscriptCorrectionConfig;
+  private readonly transcriptStore = new TranscriptStore();
+  private readonly retranscriber: Retranscriber;
+  private readonly correctionService: TranscriptCorrectionService;
+  private readonly diagnostics = new SessionTranscriptDiagnostics();
+  private readonly diagnosticsEnabled: boolean;
+  private audioBuffer: AudioRingBuffer;
+  private sampleRate: number;
   private sequence = 0;
   private targetLanguage: LanguageCode = 'tr';
   private platform: Platform = 'twitch';
@@ -62,6 +84,34 @@ export class TranslationSession {
     this.logger = options.logger;
     this.gameContext = options.gameContext;
     this.memory = options.gameContext.createMemory();
+    this.sampleRate = options.sampleRate ?? 16_000;
+    this.correctionConfig = options.correction ?? {
+      enabled: true,
+      confidenceThreshold: 0.72,
+      retranscribeTimeoutMs: 2500,
+      audioBufferMaxSeconds: 45,
+      retranscribeProvider: 'mock',
+    };
+    this.audioBuffer = new AudioRingBuffer(
+      this.sampleRate,
+      this.correctionConfig.audioBufferMaxSeconds,
+    );
+    this.retranscriber = createRetranscriber(
+      this.correctionConfig.retranscribeProvider,
+      options.openaiApiKey,
+    );
+    this.correctionService = new TranscriptCorrectionService(this.transcriptStore);
+    this.diagnosticsEnabled = process.env.NODE_ENV !== 'production';
+  }
+
+  /** Development-only transcript segment diagnostics (includes text). Empty in production. */
+  getTranscriptDiagnostics() {
+    if (!this.diagnosticsEnabled) return [];
+    return this.diagnostics.getSegments();
+  }
+
+  getTranscriptMetrics() {
+    return this.diagnostics.getMetrics();
   }
 
   attachSocket(socket: WebSocket): void {
@@ -107,9 +157,10 @@ export class TranslationSession {
   async handleAudio(chunk: Buffer): Promise<void> {
     if (!this.started || this.closed) return;
     this.audioBytes += chunk.length;
+    this.audioBuffer.push(chunk);
     this.speech.sendAudio(chunk);
 
-    const seconds = chunk.length / (16_000 * 2);
+    const seconds = chunk.length / (this.sampleRate * 2);
     const record = this.usage.addAudioSeconds(this.sessionId, seconds);
     const now = Date.now();
     if (record && now - this.lastUsageEmit > 10_000) {
@@ -172,7 +223,7 @@ export class TranslationSession {
     language?: string;
     startMs?: number;
     endMs?: number;
-  }): Promise<void> {
+  }): Promise<{ translatedText?: string; latencyMs: number }> {
     const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
     const resolved =
       this.resolvedGame ?? this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
@@ -283,6 +334,7 @@ export class TranslationSession {
       });
 
       this.context.push(final.text);
+      const latencyMs = Date.now() - translationRequestedAt;
       this.logger.info('game_translation.completed', {
         sessionId: this.sessionId,
         gameId: resolved.gameId,
@@ -290,7 +342,7 @@ export class TranslationSession {
         memoryHitCount: sessionMemory.length,
         validationPassed: true,
         retryCount,
-        latencyMs: Date.now() - translationRequestedAt,
+        latencyMs,
       });
 
       this.send({
@@ -304,6 +356,7 @@ export class TranslationSession {
         startMs: final.startMs,
         endMs: final.endMs,
       });
+      return { translatedText, latencyMs };
     } catch (error) {
       this.logger.error('translation_failed', {
         sessionId: this.sessionId,
@@ -318,6 +371,7 @@ export class TranslationSession {
         message: 'Live translation is temporarily unavailable.',
         recoverable: true,
       });
+      return { latencyMs: Date.now() - translationRequestedAt };
     }
   }
 
@@ -326,6 +380,11 @@ export class TranslationSession {
     this.started = true;
     this.targetLanguage = event.targetLanguage;
     this.platform = event.platform;
+    this.sampleRate = event.sampleRate || this.sampleRate;
+    this.audioBuffer = new AudioRingBuffer(
+      this.sampleRate,
+      this.correctionConfig.audioBufferMaxSeconds,
+    );
     this.applyStreamContext(
       event.streamContext ?? {
         platform: 'twitch',
@@ -357,7 +416,9 @@ export class TranslationSession {
 
     this.speech.onFinal(async (final) => {
       if (!final.text.trim()) return;
+      const pipelineStarted = Date.now();
 
+      // Emit raw transcript (protocol unchanged)
       this.send({
         type: 'transcript.final',
         sessionId: this.sessionId,
@@ -370,7 +431,115 @@ export class TranslationSession {
         endMs: final.endMs,
       });
 
-      await this.translateSegment(final);
+      const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
+      if (this.retranscriber instanceof MockRetranscriber) {
+        this.retranscriber.pendingRaw = final.text;
+      }
+
+      const correction = await this.correctionService.correctFinalSegment({
+        segmentId: final.segmentId,
+        rawText: final.text,
+        confidence: final.confidence,
+        startMs: final.startMs,
+        endMs: final.endMs,
+        language: final.language,
+        profile,
+        sampleRate: this.sampleRate,
+        audioBuffer: this.audioBuffer,
+        retranscriber: this.retranscriber,
+        confidenceThreshold: this.correctionConfig.confidenceThreshold,
+        retranscribeTimeoutMs: this.correctionConfig.retranscribeTimeoutMs,
+        enabled: this.correctionConfig.enabled,
+      });
+
+      this.logger.info('transcript_correction.completed', {
+        sessionId: this.sessionId,
+        segmentId: final.segmentId,
+        rawLength: correction.rawText.length,
+        correctedLength: correction.correctedText?.length ?? 0,
+        usedCorrected: Boolean(correction.correctedText),
+        retranscribed: correction.retranscribed,
+        normalized: correction.normalized,
+        timedOut: correction.timedOut,
+        isLowConfidence: correction.evaluation.isLowConfidence,
+        shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+        correctionSource: correction.correctionSource,
+        retranscribeLatencyMs: correction.retranscribeLatencyMs,
+        normalizeLatencyMs: correction.normalizeLatencyMs,
+        reasonCount: correction.evaluation.reasons.length,
+        confidenceMissing: typeof final.confidence !== 'number',
+      });
+
+      const translation = await this.translateSegment({
+        segmentId: final.segmentId,
+        text: correction.textForTranslation,
+        language: final.language,
+        startMs: final.startMs,
+        endMs: final.endMs,
+      });
+
+      const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
+      const wordConfidenceSummary = summarizeWordConfidence(
+        final.words,
+        this.correctionConfig.confidenceThreshold,
+      );
+
+      this.diagnostics.record(
+        {
+          segmentId: final.segmentId,
+          rawTranscript: correction.rawText,
+          retranscribedTranscript: correction.retranscribedText,
+          correctedTranscript: correction.correctedText,
+          translatedText: translation.translatedText,
+          sttConfidence: final.confidence,
+          wordConfidenceSummary,
+          qualityScore: correction.evaluation.score,
+          qualityReasons: correction.evaluation.reasons,
+          shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+          correctionSource: correction.correctionSource,
+          retranscribeLatencyMs: correction.retranscribeLatencyMs,
+          normalizeLatencyMs: correction.normalizeLatencyMs,
+          translationLatencyMs: translation.latencyMs,
+          totalSubtitleLatencyMs,
+          timedOut: correction.timedOut,
+          confidenceMissing: typeof final.confidence !== 'number',
+        },
+        correction.evaluation,
+      );
+
+      const metrics = this.diagnostics.getMetrics();
+      for (const warning of metrics.warnings) {
+        this.logger.warn('transcript_correction_metric_warning', {
+          sessionId: this.sessionId,
+          warning,
+          // aggregates only — no transcript text
+          totalFinalizedSegments: metrics.totalFinalizedSegments,
+          retranscriptionRate: metrics.retranscriptionRate,
+          averageLowConfidencePathLatencyMs: metrics.averageLowConfidencePathLatencyMs,
+        });
+      }
+
+      if (this.diagnosticsEnabled) {
+        this.logger.debug('transcript_segment_diagnostics', {
+          sessionId: this.sessionId,
+          segmentId: final.segmentId,
+          rawTranscript: correction.rawText,
+          retranscribedTranscript: correction.retranscribedText,
+          correctedTranscript: correction.correctedText,
+          translatedText: translation.translatedText,
+          sttConfidence: final.confidence,
+          wordConfidenceAvailable: wordConfidenceSummary.available,
+          wordConfidenceAvg: wordConfidenceSummary.avg,
+          qualityScore: correction.evaluation.score,
+          qualityReasons: correction.evaluation.reasons,
+          shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+          correctionSource: correction.correctionSource,
+          retranscribeLatencyMs: correction.retranscribeLatencyMs,
+          normalizeLatencyMs: correction.normalizeLatencyMs,
+          translationLatencyMs: translation.latencyMs,
+          totalSubtitleLatencyMs,
+        });
+      }
     });
 
     this.speech.onError((error) => {
@@ -448,6 +617,14 @@ export class TranslationSession {
     this.closed = true;
     this.started = false;
     await this.speech.close();
+    this.audioBuffer.clear();
+    this.transcriptStore.clear();
+    const metrics = this.diagnostics.getMetrics();
+    this.logger.info('session_transcript_metrics', {
+      sessionId: this.sessionId,
+      ...metrics,
+    });
+    this.diagnostics.clear();
     this.usage.end(this.sessionId);
     this.memory.clearSession();
     this.send({

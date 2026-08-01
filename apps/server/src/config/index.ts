@@ -28,6 +28,14 @@ const ConfigSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   DEEPGRAM_API_KEY: z.string().optional(),
   DEEPGRAM_MODEL: z.string().default('nova-2'),
+  TRANSCRIPT_CORRECTION_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== 'false'),
+  TRANSCRIPT_CONFIDENCE_THRESHOLD: z.coerce.number().default(0.72),
+  RETRANSCRIBE_TIMEOUT_MS: z.coerce.number().default(2500),
+  AUDIO_BUFFER_MAX_SECONDS: z.coerce.number().default(45),
+  RETRANSCRIBE_PROVIDER: z.enum(['mock', 'openai', 'none']).default('mock'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

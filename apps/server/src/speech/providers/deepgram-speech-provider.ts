@@ -2,6 +2,14 @@ import WebSocket from 'ws';
 import type { IncomingMessage } from 'node:http';
 import type { SpeechSessionOptions, SpeechToTextProvider, TranscriptEvent } from '../speech-provider.js';
 
+type DeepgramWord = {
+  word?: string;
+  punctuated_word?: string;
+  confidence?: number;
+  start?: number;
+  end?: number;
+};
+
 type DeepgramResultsMessage = {
   type?: string;
   is_final?: boolean;
@@ -9,12 +17,27 @@ type DeepgramResultsMessage = {
   start?: number;
   duration?: number;
   channel?: {
-    alternatives?: Array<{ transcript?: string; confidence?: number }>;
+    alternatives?: Array<{
+      transcript?: string;
+      confidence?: number;
+      words?: DeepgramWord[];
+    }>;
   };
 };
 
 /**
  * Deepgram live streaming STT — binary pcm_s16le frames over WebSocket.
+ *
+ * Currently configured query features:
+ * - interim_results, punctuate, smart_format, vad_events, utterance_end_ms, language
+ *
+ * NOT configured: keywords / keyterm / vocabulary boosts.
+ *
+ * Metadata actually forwarded from Results messages:
+ * - Segment confidence (alternatives[0].confidence) — when present
+ * - Segment start/end from message.start + duration
+ * - Word list with per-word confidence/start/end — when Deepgram includes `words`
+ *   (no extra query flag required; parsed if present)
  */
 export class DeepgramSpeechProvider implements SpeechToTextProvider {
   private ws: WebSocket | null = null;
@@ -157,11 +180,26 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
 
     if (message.type && message.type !== 'Results') return;
 
-    const transcript = message.channel?.alternatives?.[0]?.transcript?.trim();
+    const alternative = message.channel?.alternatives?.[0];
+    const transcript = alternative?.transcript?.trim();
     if (!transcript) return;
 
     const startMs = Math.round((message.start ?? 0) * 1000);
     const endMs = Math.round(((message.start ?? 0) + (message.duration ?? 0)) * 1000);
+    const confidence =
+      typeof alternative?.confidence === 'number' ? alternative.confidence : undefined;
+    const words = (alternative?.words ?? [])
+      .map((w) => {
+        const word = (w.punctuated_word ?? w.word)?.trim();
+        if (!word) return null;
+        return {
+          word,
+          confidence: typeof w.confidence === 'number' ? w.confidence : undefined,
+          startMs: typeof w.start === 'number' ? Math.round(w.start * 1000) : undefined,
+          endMs: typeof w.end === 'number' ? Math.round(w.end * 1000) : undefined,
+        };
+      })
+      .filter((w): w is NonNullable<typeof w> => w != null);
 
     if (message.is_final) {
       this.finalCb?.({
@@ -171,6 +209,8 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
         language: 'en',
         startMs,
         endMs,
+        confidence,
+        words: words.length > 0 ? words : undefined,
       });
       this.segmentIndex += 1;
       this.currentSegmentId = this.nextSegmentId();
@@ -182,6 +222,8 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
         language: 'en',
         startMs,
         endMs,
+        confidence,
+        words: words.length > 0 ? words : undefined,
       });
     }
   }

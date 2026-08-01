@@ -18,6 +18,16 @@ export const GameTranslationProfileSchema = z
     preferredTranslations: z.record(z.string()),
     contextualTerms: z.array(ContextualTermSchema),
     protectedPatterns: z.array(z.string()).optional(),
+    phoneticAliases: z
+      .array(
+        z.object({
+          from: z.string().min(1),
+          to: z.string().min(1),
+          requireAnyContext: z.array(z.string()).optional(),
+          forbidAnyContext: z.array(z.string()).optional(),
+        }),
+      )
+      .optional(),
     styleRules: z.array(z.string()),
     examples: z.array(
       z.object({

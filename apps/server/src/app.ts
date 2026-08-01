@@ -8,6 +8,11 @@ import { usageRoutes } from './http/usage.routes.js';
 import { UsageStore } from './usage/usage-store.js';
 import { SessionManager } from './realtime/session-manager.js';
 import { attachRealtimeGateway } from './realtime/realtime-gateway.js';
+import {
+  collectProductionReadinessWarnings,
+  estimateAudioBufferBytes,
+  logProductionReadiness,
+} from './transcript-correction/index.js';
 
 export async function buildApp(config: AppConfig) {
   const logger = createLogger(config.LOG_LEVEL);
@@ -20,6 +25,14 @@ export async function buildApp(config: AppConfig) {
     config.OPENAI_API_KEY,
     config.DEEPGRAM_API_KEY,
     config.DEEPGRAM_MODEL,
+    {
+      enabled: config.TRANSCRIPT_CORRECTION_ENABLED,
+      confidenceThreshold: config.TRANSCRIPT_CONFIDENCE_THRESHOLD,
+      retranscribeTimeoutMs: config.RETRANSCRIBE_TIMEOUT_MS,
+      audioBufferMaxSeconds: config.AUDIO_BUFFER_MAX_SECONDS,
+      retranscribeProvider: config.RETRANSCRIBE_PROVIDER,
+    },
+    config.AUDIO_SAMPLE_RATE,
   );
 
   const app = Fastify({
@@ -34,23 +47,80 @@ export async function buildApp(config: AppConfig) {
   await app.register(realtimeTokenRoutes(config));
   await app.register(usageRoutes(usage));
 
+  const audioBufferEstimate = estimateAudioBufferBytes({
+    sampleRate: config.AUDIO_SAMPLE_RATE,
+    channels: config.AUDIO_CHANNELS,
+    bitsPerSample: 16,
+    maxSeconds: config.AUDIO_BUFFER_MAX_SECONDS,
+  });
+
   app.get('/api/diagnostics', async (_request, reply) => {
     if (config.NODE_ENV === 'production') {
       return reply.status(404).send({ error: 'Not found' });
     }
+    const readiness = collectProductionReadinessWarnings(config);
+    const sessionIds = sessions.listSessionIds();
     return {
       activeSessions: sessions.size(),
       speechProvider: config.SPEECH_PROVIDER,
       translationProvider: config.TRANSLATION_PROVIDER,
+      retranscribeProvider: config.RETRANSCRIBE_PROVIDER,
+      transcriptCorrectionEnabled: config.TRANSCRIPT_CORRECTION_ENABLED,
+      confidenceThreshold: config.TRANSCRIPT_CONFIDENCE_THRESHOLD,
       hasOpenAiKey: Boolean(config.OPENAI_API_KEY),
       hasDeepgramKey: Boolean(config.DEEPGRAM_API_KEY),
       deepgramModel: config.DEEPGRAM_MODEL,
+      // Normalization is deterministic — no provider to configure
+      transcriptNormalizer: 'deterministic_profile_phonetic_aliases',
+      deepgramAdapterCapabilities: {
+        segmentConfidence: true,
+        wordConfidence: 'parsed_when_present',
+        wordTimestamps: 'parsed_when_present',
+        segmentStartEndTimestamps: true,
+        vocabularyOrKeytermHints: false,
+      },
+      audioBuffer: {
+        maxSeconds: config.AUDIO_BUFFER_MAX_SECONDS,
+        sampleRate: config.AUDIO_SAMPLE_RATE,
+        channels: config.AUDIO_CHANNELS,
+        bitsPerSample: 16,
+        maxBytes: audioBufferEstimate.bytes,
+        maxMib: Number(audioBufferEstimate.mib.toFixed(3)),
+      },
+      readinessWarnings: readiness,
+      sessionIds,
+      sessionMetrics: Object.fromEntries(
+        sessionIds.map((id) => [id, sessions.getTranscriptMetrics(id)]),
+      ),
       devAuthMode: config.DEV_AUTH_MODE,
     };
   });
 
+  /**
+   * Development-only per-segment transcript diagnostics (includes transcript text).
+   * Not available in production.
+   */
+  app.get<{ Params: { sessionId: string } }>(
+    '/api/diagnostics/transcript/:sessionId',
+    async (request, reply) => {
+      if (config.NODE_ENV === 'production') {
+        return reply.status(404).send({ error: 'Not found' });
+      }
+      const session = sessions.get(request.params.sessionId);
+      if (!session) {
+        return reply.status(404).send({ error: 'Session not found' });
+      }
+      return {
+        sessionId: request.params.sessionId,
+        metrics: session.getTranscriptMetrics(),
+        segments: session.getTranscriptDiagnostics(),
+      };
+    },
+  );
+
   await app.ready();
   attachRealtimeGateway(app.server, config, sessions, logger);
+  logProductionReadiness(config, logger);
 
   return { app, logger, sessions, usage };
 }

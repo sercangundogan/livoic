@@ -11,6 +11,8 @@ async function main() {
     host: config.HOST,
     speechProvider: config.SPEECH_PROVIDER,
     translationProvider: config.TRANSLATION_PROVIDER,
+    retranscribeProvider: config.RETRANSCRIBE_PROVIDER,
+    transcriptCorrectionEnabled: config.TRANSCRIPT_CORRECTION_ENABLED,
   });
 }
 

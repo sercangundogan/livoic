@@ -1,3 +1,10 @@
+export type TranscriptWord = {
+  word: string;
+  confidence?: number;
+  startMs?: number;
+  endMs?: number;
+};
+
 export type TranscriptEvent = {
   segmentId: string;
   text: string;
@@ -5,6 +12,10 @@ export type TranscriptEvent = {
   language?: string;
   startMs?: number;
   endMs?: number;
+  /** Provider confidence in [0, 1] when available (e.g. Deepgram alternatives[0].confidence). */
+  confidence?: number;
+  /** Word-level metadata when the streaming adapter provides it. */
+  words?: TranscriptWord[];
 };
 
 export type SpeechSessionOptions = {

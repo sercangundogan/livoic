@@ -31,13 +31,32 @@ export function createLogger(level: LogLevel = 'info') {
 
 function sanitize(fields?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!fields) return undefined;
+  const isProd = process.env.NODE_ENV === 'production';
+  const textKeys = new Set([
+    'rawtext',
+    'rawtranscript',
+    'correctedtext',
+    'correctedtranscript',
+    'retranscribedtext',
+    'retranscribedtranscript',
+    'translatedtext',
+    'transcript',
+    'sourcetext',
+    'text',
+    'pcm',
+    'audio',
+    'buffer',
+  ]);
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(fields)) {
     const lower = key.toLowerCase();
-    if (lower.includes('token') || lower.includes('authorization') || lower.includes('secret')) {
+    if (lower.includes('token') || lower.includes('authorization') || lower.includes('secret') || lower.includes('apikey') || lower.includes('api_key')) {
       out[key] = '[redacted]';
     } else if (lower.includes('audio') && typeof value !== 'number') {
       out[key] = '[omitted]';
+    } else if (isProd && (textKeys.has(lower) || lower.endsWith('transcript') || lower.endsWith('text'))) {
+      // Never send transcript content to production logs
+      out[key] = typeof value === 'string' ? `[omitted:${value.length}]` : '[omitted]';
     } else {
       out[key] = value;
     }

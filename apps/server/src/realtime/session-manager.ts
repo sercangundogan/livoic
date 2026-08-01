@@ -4,6 +4,7 @@ import { createSpeechProvider } from '../speech/create-speech-provider.js';
 import { createTranslationProvider } from '../translation/mock-translation-provider.js';
 import type { UsageStore } from '../usage/usage-store.js';
 import { createGameContextService } from '../game-context/game-context.service.js';
+import type { TranscriptCorrectionConfig } from '../transcript-correction/index.js';
 import { TranslationSession } from './translation-session.js';
 
 export class SessionManager {
@@ -18,6 +19,8 @@ export class SessionManager {
     private readonly openaiApiKey?: string,
     private readonly deepgramApiKey?: string,
     private readonly deepgramModel?: string,
+    private readonly correction?: TranscriptCorrectionConfig,
+    private readonly sampleRate = 16_000,
   ) {}
 
   getOrCreate(sessionId: string, userId: string, socket: WebSocket): TranslationSession {
@@ -41,6 +44,9 @@ export class SessionManager {
       usage: this.usage,
       logger: this.logger,
       gameContext: this.gameContext,
+      correction: this.correction,
+      openaiApiKey: this.openaiApiKey,
+      sampleRate: this.sampleRate,
     });
     this.sessions.set(sessionId, session);
     return session;
@@ -59,5 +65,17 @@ export class SessionManager {
 
   size(): number {
     return this.sessions.size;
+  }
+
+  listSessionIds(): string[] {
+    return [...this.sessions.keys()];
+  }
+
+  getTranscriptDiagnostics(sessionId: string) {
+    return this.sessions.get(sessionId)?.getTranscriptDiagnostics() ?? [];
+  }
+
+  getTranscriptMetrics(sessionId: string) {
+    return this.sessions.get(sessionId)?.getTranscriptMetrics() ?? null;
   }
 }
