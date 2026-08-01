@@ -1,8 +1,14 @@
-import type { LanguageCode, SessionStatus } from '@live-translator/protocol';
+import type { LanguageCode, SessionStatus, StreamContext } from '@live-translator/protocol';
 import { createAppError, isActiveSession, transition } from '@live-translator/shared';
 import type { AppError } from '@live-translator/shared';
 import { API_BASE, OFFSCREEN_JUSTIFICATION, OFFSCREEN_REASONS, OFFSCREEN_URL } from '../shared/constants.js';
-import type { ExtensionMessage, PageDetection, SessionSnapshot, UserSettings } from '../shared/messages.js';
+import type {
+  ExtensionMessage,
+  GameContextInfo,
+  PageDetection,
+  SessionSnapshot,
+  UserSettings,
+} from '../shared/messages.js';
 import { detectPageFromUrl } from '../shared/page-detection.js';
 import { sendTabMessage } from '../shared/messaging.js';
 import {
@@ -23,6 +29,7 @@ export class SessionController {
   private targetLanguage: LanguageCode = 'tr';
   private settings: UserSettings | null = null;
   private audioSecondsToday = 0;
+  private gameContext: GameContextInfo | null = null;
 
   async init(): Promise<void> {
     this.settings = await loadSettings();
@@ -35,6 +42,7 @@ export class SessionController {
     if (meta.sourceLanguage) this.sourceLanguage = meta.sourceLanguage;
     if (meta.lastError) this.error = meta.lastError;
     if (typeof meta.audioSecondsToday === 'number') this.audioSecondsToday = meta.audioSecondsToday;
+    if (meta.gameContext) this.gameContext = meta.gameContext;
   }
 
   getSnapshot(): SessionSnapshot {
@@ -47,6 +55,7 @@ export class SessionController {
       error: this.error,
       page: this.page,
       audioSecondsToday: this.audioSecondsToday,
+      gameContext: this.gameContext,
     };
   }
 
@@ -68,7 +77,11 @@ export class SessionController {
   }
 
   async detectActiveTab(): Promise<SessionSnapshot> {
-    this.setStatus('detecting');
+    const wasActive = isActiveSession(this.status);
+    if (!wasActive) {
+      this.setStatus('detecting');
+    }
+
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id || !tab.url) {
       this.page = {
@@ -77,31 +90,50 @@ export class SessionController {
         hasPlayer: false,
         url: '',
       };
-      this.setStatus('idle');
-      this.error = createAppError('UNSUPPORTED_PAGE');
+      if (!wasActive) {
+        this.setStatus('idle');
+        this.error = createAppError('UNSUPPORTED_PAGE');
+      }
       return this.getSnapshot();
     }
 
     this.tabId = tab.id;
-    this.page = detectPageFromUrl(tab.url);
+    const urlPage = detectPageFromUrl(tab.url);
+    const previousGame = {
+      gameName: this.page?.gameName,
+      gameSlug: this.page?.gameSlug,
+    };
+    this.page = {
+      ...urlPage,
+      ...previousGame,
+    };
 
     // Ask content script for richer player info when on Twitch
     if (this.page.supported) {
       const info = (await sendTabMessage(tab.id, { type: 'popup.detectPage' })) as
         | { page?: PageDetection }
         | undefined;
-      if (info?.page) this.page = info.page;
+      if (info?.page) {
+        this.page = {
+          ...info.page,
+          // Never wipe a known category if the DOM momentarily lacks the game link.
+          gameName: info.page.gameName || previousGame.gameName || this.gameContext?.displayName,
+          gameSlug: info.page.gameSlug || previousGame.gameSlug,
+        };
+      }
     }
 
-    if (!this.page.supported) {
-      this.error = createAppError('UNSUPPORTED_PAGE');
-      this.setStatus('idle');
-    } else if (!this.page.hasPlayer) {
-      this.error = createAppError('PLAYER_NOT_FOUND');
-      this.setStatus('idle');
-    } else if (!isActiveSession(this.status)) {
-      this.error = null;
-      this.setStatus('ready');
+    if (!wasActive) {
+      if (!this.page.supported) {
+        this.error = createAppError('UNSUPPORTED_PAGE');
+        this.setStatus('idle');
+      } else if (!this.page.hasPlayer) {
+        this.error = createAppError('PLAYER_NOT_FOUND');
+        this.setStatus('idle');
+      } else {
+        this.error = null;
+        this.setStatus('ready');
+      }
     }
 
     await this.persist();
@@ -122,6 +154,15 @@ export class SessionController {
     this.targetLanguage = targetLanguage;
     await saveSettings({ targetLanguage });
     this.error = null;
+    // Show category in the popup immediately; server upgrades this on context.ready.
+    if (this.page?.gameName) {
+      this.gameContext = {
+        id: this.gameContext?.id ?? null,
+        displayName: this.page.gameName,
+        profileApplied: this.gameContext?.profileApplied ?? false,
+        confidence: this.gameContext?.confidence,
+      };
+    }
     this.setStatus('requesting-permission');
     this.sessionId = crypto.randomUUID();
     await this.persist();
@@ -138,6 +179,7 @@ export class SessionController {
         sessionId: this.sessionId,
         targetLanguage,
         apiBase: API_BASE,
+        streamContext: this.buildStreamContext(),
       } satisfies ExtensionMessage);
 
       if (this.tabId != null) {
@@ -181,6 +223,7 @@ export class SessionController {
     }
     this.setStatus('stopped');
     this.sessionId = null;
+    this.gameContext = null;
     await clearSessionMeta();
     this.setStatus('ready');
     await this.persist();
@@ -210,6 +253,27 @@ export class SessionController {
 
     // Do not forward source-language partials to the overlay.
     // Translation-only UX waits for translation.final to avoid English flashes.
+
+    if (event.type === 'translation.context.ready') {
+      this.gameContext = {
+        id: event.game.id,
+        displayName: event.game.displayName,
+        profileApplied: event.game.profileApplied,
+        confidence: event.game.confidence,
+      };
+      if (event.game.displayName) {
+        this.page = {
+          ...(this.page ?? {
+            supported: true,
+            platform: 'twitch',
+            hasPlayer: true,
+            url: '',
+          }),
+          gameName: event.game.displayName,
+        };
+      }
+      await this.persist();
+    }
 
     if (event.type === 'translation.final') {
       await sendTabMessage(this.tabId, {
@@ -256,6 +320,52 @@ export class SessionController {
     }
   }
 
+  async handleStreamContextUpdate(streamContext: StreamContext): Promise<void> {
+    if (streamContext.gameName) {
+      this.page = {
+        ...(this.page ?? {
+          supported: true,
+          platform: 'twitch',
+          hasPlayer: true,
+          url: '',
+        }),
+        gameName: streamContext.gameName,
+        gameSlug: streamContext.gameSlug,
+        title: streamContext.streamTitle ?? this.page?.title,
+        channel: streamContext.channelName ?? this.page?.channel,
+      };
+      if (!this.gameContext?.profileApplied) {
+        this.gameContext = {
+          id: this.gameContext?.id ?? null,
+          displayName: streamContext.gameName,
+          profileApplied: false,
+          confidence: this.gameContext?.confidence,
+        };
+      }
+      await this.persist();
+    }
+    if (!isActiveSession(this.status)) return;
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'offscreen.streamContext',
+        streamContext,
+      } satisfies ExtensionMessage);
+    } catch {
+      // offscreen may be gone
+    }
+  }
+
+  private buildStreamContext(): StreamContext {
+    return {
+      platform: 'twitch',
+      channelName: this.page?.channel,
+      streamTitle: this.page?.title,
+      gameName: this.page?.gameName,
+      gameSlug: this.page?.gameSlug,
+      detectedAt: Date.now(),
+    };
+  }
+
   private setStatus(next: SessionStatus): void {
     const result = transition(this.status, next);
     if (result.ok) {
@@ -275,6 +385,7 @@ export class SessionController {
       targetLanguage: this.targetLanguage,
       lastError: this.error ?? undefined,
       audioSecondsToday: this.audioSecondsToday,
+      gameContext: this.gameContext,
     });
   }
 

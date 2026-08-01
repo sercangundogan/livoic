@@ -1,8 +1,8 @@
 import { create } from 'zustand';
 import type { LanguageCode, SessionStatus } from '@live-translator/protocol';
 import type { AppError } from '@live-translator/shared';
-import type { PageDetection, SessionSnapshot, UserSettings } from '../shared/messages.js';
-import { DEFAULT_SETTINGS } from '@live-translator/shared';
+import { DEFAULT_SETTINGS, isActiveSession } from '@live-translator/shared';
+import type { GameContextInfo, PageDetection, SessionSnapshot, UserSettings } from '../shared/messages.js';
 import { sendMessage } from '../shared/messaging.js';
 
 type PopupState = {
@@ -13,9 +13,10 @@ type PopupState = {
   sourceLanguage: LanguageCode;
   targetLanguage: LanguageCode;
   audioSecondsToday: number;
+  gameContext: GameContextInfo | null;
   loading: boolean;
   settingsOpen: boolean;
-  hydrate: () => Promise<void>;
+  hydrate: (opts?: { silent?: boolean }) => Promise<void>;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   setTargetLanguage: (code: LanguageCode) => Promise<void>;
@@ -31,6 +32,7 @@ function applySnapshot(snapshot: SessionSnapshot) {
     sourceLanguage: snapshot.sourceLanguage,
     targetLanguage: snapshot.targetLanguage,
     audioSecondsToday: snapshot.audioSecondsToday ?? 0,
+    gameContext: snapshot.gameContext ?? null,
   };
 }
 
@@ -49,11 +51,13 @@ export const usePopupStore = create<PopupState>((set, get) => ({
   sourceLanguage: 'auto',
   targetLanguage: DEFAULT_SETTINGS.targetLanguage,
   audioSecondsToday: 0,
+  gameContext: null,
   loading: true,
   settingsOpen: false,
 
-  hydrate: async () => {
-    set({ loading: true });
+  hydrate: async (opts) => {
+    const silent = opts?.silent === true;
+    if (!silent) set({ loading: true });
     const res = await sendMessage({ type: 'popup.getState' });
     if (res.ok && 'snapshot' in res) {
       set({
@@ -79,6 +83,12 @@ export const usePopupStore = create<PopupState>((set, get) => ({
         settings: res.settings,
         loading: false,
       });
+      // Game profile arrives shortly after session.start — refresh a few times.
+      for (const delay of [300, 700, 1200, 2000, 3500]) {
+        window.setTimeout(() => {
+          void get().hydrate({ silent: true });
+        }, delay);
+      }
     } else if (!res.ok) {
       set({ error: res.error, loading: false, status: 'error' });
     }
@@ -115,3 +125,29 @@ export const usePopupStore = create<PopupState>((set, get) => ({
 
   setSettingsOpen: (open) => set({ settingsOpen: open }),
 }));
+
+/** Keep popup in sync while open (game context arrives after start). */
+export function bindPopupLiveSync(): () => void {
+  const onStorage = (
+    changes: Record<string, chrome.storage.StorageChange>,
+    area: string,
+  ) => {
+    if (area !== 'session') return;
+    if (changes.gameContext || changes.sessionStatus || changes.audioSecondsToday) {
+      void usePopupStore.getState().hydrate({ silent: true });
+    }
+  };
+  chrome.storage.onChanged.addListener(onStorage);
+
+  const timer = window.setInterval(() => {
+    const { status } = usePopupStore.getState();
+    if (isActiveSession(status) || status === 'connecting' || status === 'requesting-permission') {
+      void usePopupStore.getState().hydrate({ silent: true });
+    }
+  }, 1500);
+
+  return () => {
+    chrome.storage.onChanged.removeListener(onStorage);
+    window.clearInterval(timer);
+  };
+}

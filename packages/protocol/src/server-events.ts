@@ -50,6 +50,16 @@ export const UsageUpdateEventSchema = BaseServerEventSchema.extend({
   audioSecondsToday: z.number().nonnegative().optional(),
 });
 
+export const TranslationContextReadyEventSchema = BaseServerEventSchema.extend({
+  type: z.literal('translation.context.ready'),
+  game: z.object({
+    id: z.string().nullable(),
+    displayName: z.string().optional(),
+    profileApplied: z.boolean(),
+    confidence: z.number().optional(),
+  }),
+});
+
 export const ErrorEventSchema = BaseServerEventSchema.extend({
   type: z.literal('error'),
   code: AppErrorCodeSchema,
@@ -69,6 +79,7 @@ export const ServerEventSchema = z.discriminatedUnion('type', [
   TranscriptFinalEventSchema,
   TranslationFinalEventSchema,
   UsageUpdateEventSchema,
+  TranslationContextReadyEventSchema,
   ErrorEventSchema,
   PongEventSchema,
 ]);
@@ -79,6 +90,7 @@ export type TranscriptPartialEvent = z.infer<typeof TranscriptPartialEventSchema
 export type TranscriptFinalEvent = z.infer<typeof TranscriptFinalEventSchema>;
 export type TranslationFinalEvent = z.infer<typeof TranslationFinalEventSchema>;
 export type UsageUpdateEvent = z.infer<typeof UsageUpdateEventSchema>;
+export type TranslationContextReadyEvent = z.infer<typeof TranslationContextReadyEventSchema>;
 export type ErrorEvent = z.infer<typeof ErrorEventSchema>;
 export type PongEvent = z.infer<typeof PongEventSchema>;
 export type ServerEvent = z.infer<typeof ServerEventSchema>;

@@ -7,5 +7,7 @@ export interface PlayerAdapter {
     platform: string;
     channel?: string;
     title?: string;
+    gameName?: string;
+    gameSlug?: string;
   };
 }

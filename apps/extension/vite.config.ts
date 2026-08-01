@@ -27,6 +27,7 @@ function writeManifestAndAssets() {
     permissions: ['activeTab', 'tabCapture', 'offscreen', 'storage'],
     host_permissions: [
       'https://www.twitch.tv/*',
+      'https://gql.twitch.tv/*',
       'http://localhost:4000/*',
       'http://127.0.0.1:4000/*',
     ],
@@ -109,6 +110,13 @@ async function buildStandaloneScripts() {
 function extensionBuildPlugin() {
   return {
     name: 'live-translator-extension',
+    buildStart() {
+      // Ensure content/worklet source edits invalidate the watched build.
+      this.addWatchFile(resolve(root, 'src/content'));
+      this.addWatchFile(resolve(root, 'src/offscreen/audio-worklet.ts'));
+      this.addWatchFile(resolve(root, 'src/offscreen/offscreen.html'));
+      this.addWatchFile(resolve(root, 'public'));
+    },
     async closeBundle() {
       await buildStandaloneScripts();
       writeManifestAndAssets();

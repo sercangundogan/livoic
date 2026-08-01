@@ -41,12 +41,32 @@ describe('protocol validation', () => {
     expect(result.success).toBe(true);
   });
 
-  it('rejects server events without sequence', () => {
-    const result = ServerEventSchema.safeParse({
-      type: 'pong',
+  it('accepts stream.context.update', () => {
+    const result = ClientEventSchema.safeParse({
+      type: 'stream.context.update',
       sessionId: '550e8400-e29b-41d4-a716-446655440000',
-      timestamp: Date.now(),
+      streamContext: {
+        platform: 'twitch',
+        gameName: 'Path of Exile',
+        channelName: 'streamer',
+      },
     });
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts translation.context.ready', () => {
+    const result = ServerEventSchema.safeParse({
+      type: 'translation.context.ready',
+      sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      sequence: 3,
+      timestamp: Date.now(),
+      game: {
+        id: 'path-of-exile',
+        displayName: 'Path of Exile',
+        profileApplied: true,
+        confidence: 1,
+      },
+    });
+    expect(result.success).toBe(true);
   });
 });

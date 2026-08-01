@@ -60,6 +60,7 @@ export type SessionMeta = {
   lastError?: AppError;
   userId?: string;
   audioSecondsToday?: number;
+  gameContext?: import('./messages.js').GameContextInfo | null;
 };
 
 export async function loadSessionMeta(): Promise<SessionMeta> {

@@ -5,12 +5,19 @@ import type {
   Platform,
   ServerEvent,
   SessionStartEvent,
+  StreamContext,
 } from '@live-translator/protocol';
 import type { Logger } from '../observability/logger.js';
 import type { SpeechToTextProvider } from '../speech/speech-provider.js';
 import type { TranslationProvider } from '../translation/translation-provider.js';
 import { ContextManager } from '../translation/context-manager.js';
 import type { UsageStore } from '../usage/usage-store.js';
+import type { GameContextService } from '../game-context/game-context.service.js';
+import type { TranslationMemory } from '../game-context/translation-memory.js';
+import type {
+  GameTranslationProfile,
+  ResolvedGameContext,
+} from '../game-context/types.js';
 
 export type TranslationSessionOptions = {
   sessionId: string;
@@ -20,6 +27,7 @@ export type TranslationSessionOptions = {
   translation: TranslationProvider;
   usage: UsageStore;
   logger: Logger;
+  gameContext: GameContextService;
 };
 
 export class TranslationSession {
@@ -30,10 +38,15 @@ export class TranslationSession {
   private readonly translation: TranslationProvider;
   private readonly usage: UsageStore;
   private readonly logger: Logger;
+  private readonly gameContext: GameContextService;
   private readonly context = new ContextManager();
+  private readonly memory: TranslationMemory;
   private sequence = 0;
   private targetLanguage: LanguageCode = 'tr';
   private platform: Platform = 'twitch';
+  private streamContext?: StreamContext;
+  private resolvedGame?: ResolvedGameContext;
+  private gameProfile?: GameTranslationProfile;
   private started = false;
   private audioBytes = 0;
   private lastUsageEmit = 0;
@@ -47,6 +60,8 @@ export class TranslationSession {
     this.translation = options.translation;
     this.usage = options.usage;
     this.logger = options.logger;
+    this.gameContext = options.gameContext;
+    this.memory = options.gameContext.createMemory();
   }
 
   attachSocket(socket: WebSocket): void {
@@ -74,6 +89,9 @@ export class TranslationSession {
       case 'settings.update':
         if (event.targetLanguage) this.targetLanguage = event.targetLanguage;
         break;
+      case 'stream.context.update':
+        this.applyStreamContext(event.streamContext, true);
+        break;
       case 'ping':
         this.send({
           type: 'pong',
@@ -91,7 +109,6 @@ export class TranslationSession {
     this.audioBytes += chunk.length;
     this.speech.sendAudio(chunk);
 
-    // pcm_s16le mono 16kHz: 2 bytes per sample → seconds = bytes / (16000 * 2)
     const seconds = chunk.length / (16_000 * 2);
     const record = this.usage.addAudioSeconds(this.sessionId, seconds);
     const now = Date.now();
@@ -108,11 +125,214 @@ export class TranslationSession {
     }
   }
 
+  private applyStreamContext(streamContext: StreamContext, emit: boolean): void {
+    const previousGameId = this.resolvedGame?.gameId ?? null;
+    this.streamContext = {
+      ...streamContext,
+      detectedAt: streamContext.detectedAt ?? Date.now(),
+    };
+    const { resolvedGame, profile } = this.gameContext.getTranslationContext(this.streamContext);
+    this.resolvedGame = resolvedGame;
+    this.gameProfile = profile;
+
+    if (previousGameId && previousGameId !== resolvedGame.gameId) {
+      this.memory.clearGameSpecific(true);
+      this.context.clear();
+    }
+
+    if (emit) {
+      this.emitContextReady();
+    }
+  }
+
+  private emitContextReady(): void {
+    const profileApplied = Boolean(
+      this.resolvedGame?.gameId && this.gameProfile && this.gameProfile.id !== 'generic-gaming',
+    );
+    this.send({
+      type: 'translation.context.ready',
+      sessionId: this.sessionId,
+      sequence: this.nextSequence(),
+      timestamp: Date.now(),
+      game: {
+        id: this.resolvedGame?.gameId ?? null,
+        displayName:
+          this.resolvedGame?.displayName ??
+          this.streamContext?.gameName ??
+          this.gameProfile?.displayName,
+        profileApplied,
+        confidence: this.resolvedGame?.confidence,
+      },
+    });
+  }
+
+  private async translateSegment(final: {
+    segmentId: string;
+    text: string;
+    language?: string;
+    startMs?: number;
+    endMs?: number;
+  }): Promise<void> {
+    const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
+    const resolved =
+      this.resolvedGame ?? this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
+    const previous = this.context.getPrevious();
+    const matched = this.gameContext.matchTerms(final.text, profile);
+    const sessionMemory = this.memory.getRelevantEntries(final.text, resolved.gameId);
+    const { maskedText, termMap } = this.gameContext.protect(final.text, matched);
+    const prompt = this.gameContext.buildPrompt({
+      currentText: maskedText,
+      previousSegments: previous,
+      targetLanguage: this.targetLanguage,
+      sourceLanguage: final.language,
+      resolvedGame: resolved,
+      profile,
+      matchedTerminology: matched,
+      sessionMemory,
+    });
+
+    const translationRequestedAt = Date.now();
+    let translatedText = '';
+    let retryCount = 0;
+
+    const runProvider = async (stronger = false) => {
+      const result = await this.translation.translate({
+        text: maskedText,
+        sourceLanguage: final.language,
+        targetLanguage: this.targetLanguage,
+        previousSegments: previous,
+        platform: this.platform,
+        category: this.streamContext?.gameName,
+        prompt: stronger
+          ? {
+              system: `${prompt.system}\n\nCRITICAL: Preserve every placeholder token like __TERM_0__ unchanged, and preserve all official game names exactly.`,
+              user: prompt.user,
+            }
+          : prompt,
+        domainContext: {
+          type: 'gaming',
+          name: resolved.displayName ?? profile.displayName,
+          description: profile.contextDescription,
+          terminology: matched.slice(0, 12).map((m) => ({
+            source: m.sourceTerm,
+            behavior: m.behavior === 'preserve' ? 'preserve' : 'preferred',
+            target: m.preferredOutput,
+          })),
+          examples: profile.examples.slice(0, 3),
+        },
+      });
+      return result.translatedText;
+    };
+
+    try {
+      translatedText = await runProvider(false);
+      const restored = this.gameContext.restore(translatedText, termMap);
+      translatedText = restored.text;
+
+      let validation = this.gameContext.validate({
+        sourceText: final.text,
+        translatedText,
+        matchedTerminology: matched,
+        profile,
+      });
+      translatedText = validation.translatedText;
+
+      if (!validation.ok && validation.shouldRetry) {
+        retryCount = 1;
+        translatedText = await runProvider(true);
+        const restoredRetry = this.gameContext.restore(translatedText, termMap);
+        translatedText = restoredRetry.text;
+        validation = this.gameContext.validate({
+          sourceText: final.text,
+          translatedText,
+          matchedTerminology: matched,
+          profile,
+        });
+        translatedText = validation.translatedText;
+        if (restoredRetry.unresolved.length || !validation.ok) {
+          this.logger.warn('game_translation.validation_failed', {
+            sessionId: this.sessionId,
+            gameId: resolved.gameId,
+            issues: validation.issues,
+            unresolvedPlaceholders: restoredRetry.unresolved.length,
+          });
+        }
+      }
+
+      for (const match of matched) {
+        if (match.behavior === 'preserve') {
+          this.memory.remember({
+            source: match.sourceTerm,
+            target: match.sourceTerm,
+            normalizedSource: match.normalizedTerm.toLowerCase(),
+            gameId: resolved.gameId,
+            usageCount: 1,
+            lastUsedAt: Date.now(),
+            sourceType: 'profile',
+          });
+        }
+      }
+      this.memory.remember({
+        source: final.text,
+        target: translatedText,
+        normalizedSource: final.text.toLowerCase().slice(0, 80),
+        gameId: resolved.gameId,
+        usageCount: 1,
+        lastUsedAt: Date.now(),
+        sourceType: 'provider',
+      });
+
+      this.context.push(final.text);
+      this.logger.info('game_translation.completed', {
+        sessionId: this.sessionId,
+        gameId: resolved.gameId,
+        matchedTermCount: matched.length,
+        memoryHitCount: sessionMemory.length,
+        validationPassed: true,
+        retryCount,
+        latencyMs: Date.now() - translationRequestedAt,
+      });
+
+      this.send({
+        type: 'translation.final',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        segmentId: final.segmentId,
+        sourceText: final.text,
+        translatedText,
+        startMs: final.startMs,
+        endMs: final.endMs,
+      });
+    } catch (error) {
+      this.logger.error('translation_failed', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : 'unknown',
+      });
+      this.send({
+        type: 'error',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        code: 'PROVIDER_UNAVAILABLE',
+        message: 'Live translation is temporarily unavailable.',
+        recoverable: true,
+      });
+    }
+  }
+
   private async start(event: SessionStartEvent): Promise<void> {
     if (this.started) return;
     this.started = true;
     this.targetLanguage = event.targetLanguage;
     this.platform = event.platform;
+    this.applyStreamContext(
+      event.streamContext ?? {
+        platform: 'twitch',
+        detectedAt: Date.now(),
+      },
+      false,
+    );
 
     this.usage.start({
       userId: this.userId,
@@ -150,48 +370,7 @@ export class TranslationSession {
         endMs: final.endMs,
       });
 
-      const previous = this.context.getPrevious();
-      const translationRequestedAt = Date.now();
-      try {
-        const result = await this.translation.translate({
-          text: final.text,
-          sourceLanguage: final.language,
-          targetLanguage: this.targetLanguage,
-          previousSegments: previous,
-          platform: this.platform,
-        });
-        this.context.push(final.text);
-        this.logger.info('translation_completed', {
-          sessionId: this.sessionId,
-          segmentId: final.segmentId,
-          latencyMs: Date.now() - translationRequestedAt,
-        });
-        this.send({
-          type: 'translation.final',
-          sessionId: this.sessionId,
-          sequence: this.nextSequence(),
-          timestamp: Date.now(),
-          segmentId: final.segmentId,
-          sourceText: final.text,
-          translatedText: result.translatedText,
-          startMs: final.startMs,
-          endMs: final.endMs,
-        });
-      } catch (error) {
-        this.logger.error('translation_failed', {
-          sessionId: this.sessionId,
-          error: error instanceof Error ? error.message : 'unknown',
-        });
-        this.send({
-          type: 'error',
-          sessionId: this.sessionId,
-          sequence: this.nextSequence(),
-          timestamp: Date.now(),
-          code: 'PROVIDER_UNAVAILABLE',
-          message: 'Live translation is temporarily unavailable.',
-          recoverable: true,
-        });
-      }
+      await this.translateSegment(final);
     });
 
     this.speech.onError((error) => {
@@ -243,6 +422,8 @@ export class TranslationSession {
       detectedSourceLanguage: 'en',
     });
 
+    this.emitContextReady();
+
     this.send({
       type: 'session.status',
       sessionId: this.sessionId,
@@ -256,6 +437,9 @@ export class TranslationSession {
       userId: this.userId,
       platform: event.platform,
       targetLanguage: event.targetLanguage,
+      gameId: this.resolvedGame?.gameId,
+      gameConfidence: this.resolvedGame?.confidence,
+      profileId: this.gameProfile?.id,
     });
   }
 
@@ -265,6 +449,7 @@ export class TranslationSession {
     this.started = false;
     await this.speech.close();
     this.usage.end(this.sessionId);
+    this.memory.clearSession();
     this.send({
       type: 'session.status',
       sessionId: this.sessionId,

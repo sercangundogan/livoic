@@ -1,0 +1,63 @@
+{
+  "id": "league-of-legends",
+  "displayName": "League of Legends",
+  "aliases": ["lol", "league", "league of legends"],
+  "contextDescription": "MOBA with champions, roles, objectives and ranked play.",
+  "preserveTerms": [
+    "Baron Nashor",
+    "Dragon",
+    "Herald",
+    "Summoner's Rift",
+    "Flash",
+    "Teleport",
+    "Ignite",
+    "Exhaust",
+    "Barrier",
+    "Hextech",
+    "ADC",
+    "JG",
+    "MID",
+    "TOP",
+    "SUP"
+  ],
+  "preferredTranslations": {
+    "gank": "gank",
+    "farming": "farm yapmak",
+    "ward": "ward",
+    "ulti": "ulti",
+    "ultimate": "ulti",
+    "feed": "feed",
+    "int": "int",
+    "tilt": "tilt",
+    "draft": "draft",
+    "ban": "ban"
+  },
+  "contextualTerms": [
+    {
+      "term": "build",
+      "meaning": "Item build for a champion.",
+      "preferredTranslation": "build"
+    },
+    {
+      "term": "support",
+      "meaning": "Support role.",
+      "preferredTranslation": "support",
+      "preserve": true
+    }
+  ],
+  "styleRules": [
+    "Keep champion and ability names in English.",
+    "Use Turkish LoL community phrasing.",
+    "Preserve role abbreviations."
+  ],
+  "examples": [
+    {
+      "source": "We need vision before Baron.",
+      "target": "Baron öncesi vision lazım."
+    }
+  ],
+  "metadata": {
+    "version": 1,
+    "updatedAt": "2026-08-01"
+  }
+}

@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { isActiveSession } from '@live-translator/shared';
-import { usePopupStore } from './popup-store.js';
+import { bindPopupLiveSync, usePopupStore } from './popup-store.js';
 import { Header } from './components/Header.js';
 import { DetectionStatus } from './components/DetectionStatus.js';
 import { LanguageSelector } from './components/LanguageSelector.js';
@@ -18,6 +18,7 @@ export function Popup() {
     sourceLanguage,
     targetLanguage,
     audioSecondsToday,
+    gameContext,
     loading,
     settingsOpen,
     hydrate,
@@ -30,6 +31,7 @@ export function Popup() {
 
   useEffect(() => {
     void hydrate();
+    return bindPopupLiveSync();
   }, [hydrate]);
 
   const canStart =
@@ -47,8 +49,12 @@ export function Popup() {
       }}
     >
       <Header onSettings={() => setSettingsOpen(!settingsOpen)} />
-      <DetectionStatus page={page} status={status} errorMessage={error?.message} />
-
+      <DetectionStatus
+        page={page}
+        status={status}
+        errorMessage={error?.message}
+        gameContext={gameContext}
+      />
       <LanguageSelector
         value={targetLanguage}
         recent={settings.recentLanguages}
@@ -68,6 +74,8 @@ export function Popup() {
         status={status}
         sourceLanguage={sourceLanguage}
         targetLanguage={targetLanguage}
+        gameContext={gameContext}
+        page={page}
       />
 
       {error?.detail && status === 'error' && (

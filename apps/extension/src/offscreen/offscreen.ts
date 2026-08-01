@@ -42,6 +42,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           sessionId: message.sessionId,
           targetLanguage: message.targetLanguage,
           platform: 'twitch',
+          streamContext: message.streamContext,
         });
         sendResponse({ ok: true });
       } catch (error) {
@@ -53,6 +54,12 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         } satisfies ExtensionMessage);
         sendResponse({ ok: false });
       }
+      return;
+    }
+
+    if (message.type === 'offscreen.streamContext') {
+      client?.updateStreamContext(message.streamContext);
+      sendResponse({ ok: true });
       return;
     }
 

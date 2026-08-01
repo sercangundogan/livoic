@@ -3,10 +3,12 @@ import type { Logger } from '../observability/logger.js';
 import { createSpeechProvider } from '../speech/create-speech-provider.js';
 import { createTranslationProvider } from '../translation/mock-translation-provider.js';
 import type { UsageStore } from '../usage/usage-store.js';
+import { createGameContextService } from '../game-context/game-context.service.js';
 import { TranslationSession } from './translation-session.js';
 
 export class SessionManager {
   private readonly sessions = new Map<string, TranslationSession>();
+  private readonly gameContext = createGameContextService();
 
   constructor(
     private readonly speechProviderName: string,
@@ -38,6 +40,7 @@ export class SessionManager {
       translation: createTranslationProvider(this.translationProviderName, this.openaiApiKey),
       usage: this.usage,
       logger: this.logger,
+      gameContext: this.gameContext,
     });
     this.sessions.set(sessionId, session);
     return session;

@@ -50,9 +50,14 @@ export function createMessageRouter(controller: SessionController) {
             break;
           }
           case 'offscreen.start':
-          case 'offscreen.stop': {
-            // Handled exclusively by the offscreen document — do not acknowledge here
-            // or chrome.runtime.sendMessage from the service worker resolves too early.
+          case 'offscreen.stop':
+          case 'offscreen.streamContext': {
+            // Handled exclusively by the offscreen document
+            break;
+          }
+          case 'content.streamContext': {
+            await controller.handleStreamContextUpdate(message.streamContext);
+            sendResponse({ ok: true });
             break;
           }
           case 'content.pageInfo': {

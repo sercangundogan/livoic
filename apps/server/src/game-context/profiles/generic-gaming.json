@@ -1,0 +1,73 @@
+{
+  "id": "generic-gaming",
+  "displayName": "Generic Gaming",
+  "aliases": ["gaming", "generic", "live streaming"],
+  "contextDescription": "General live-stream gaming speech for Turkish viewers who understand common English gaming terms.",
+  "preserveTerms": [
+    "DPS",
+    "PvP",
+    "PvE",
+    "NPC",
+    "AFK",
+    "GG",
+    "ult",
+    "ultimate",
+    "cooldown",
+    "respawn",
+    "tank",
+    "support",
+    "carry",
+    "clutch",
+    "rank",
+    "elo",
+    "MMR"
+  ],
+  "preferredTranslations": {
+    "build": "build",
+    "buff": "buff",
+    "nerf": "nerf",
+    "boss": "boss",
+    "raid": "raid",
+    "farm": "farm",
+    "farming": "farm yapmak",
+    "loot": "loot",
+    "drop": "drop",
+    "skill": "skill",
+    "damage": "hasar",
+    "health": "can",
+    "mana": "mana",
+    "inventory": "envanter"
+  },
+  "contextualTerms": [
+    {
+      "term": "build",
+      "meaning": "Character or loadout setup.",
+      "preferredTranslation": "build"
+    },
+    {
+      "term": "farm",
+      "meaning": "Repeatedly collecting resources or XP.",
+      "preferredTranslation": "farm"
+    }
+  ],
+  "styleRules": [
+    "Use natural Turkish gaming language.",
+    "Keep widely used English gaming terms in English.",
+    "Translate normal speech naturally and informally.",
+    "Do not invent awkward Turkish equivalents for common gaming slang."
+  ],
+  "examples": [
+    {
+      "source": "Bro, this build is actually cracked.",
+      "target": "Dostum, bu build gerçekten aşırı güçlü."
+    },
+    {
+      "source": "We need to farm a bit more.",
+      "target": "Biraz daha farm yapmamız lazım."
+    }
+  ],
+  "metadata": {
+    "version": 1,
+    "updatedAt": "2026-08-01"
+  }
+}

@@ -2,6 +2,7 @@ import type {
   AppErrorCode,
   LanguageCode,
   SessionStatus,
+  StreamContext,
   SubtitleBackground,
   SubtitleMode,
   SubtitlePosition,
@@ -16,7 +17,16 @@ export type PageDetection = {
   hasPlayer: boolean;
   channel?: string;
   title?: string;
+  gameName?: string;
+  gameSlug?: string;
   url: string;
+};
+
+export type GameContextInfo = {
+  id: string | null;
+  displayName?: string;
+  profileApplied: boolean;
+  confidence?: number;
 };
 
 export type UserSettings = {
@@ -37,6 +47,7 @@ export type SessionSnapshot = {
   error: AppError | null;
   page: PageDetection | null;
   audioSecondsToday?: number;
+  gameContext?: GameContextInfo | null;
 };
 
 export type ExtensionMessage =
@@ -46,6 +57,7 @@ export type ExtensionMessage =
   | { type: 'popup.updateSettings'; settings: Partial<UserSettings> }
   | { type: 'popup.detectPage' }
   | { type: 'content.pageInfo'; page: PageDetection }
+  | { type: 'content.streamContext'; streamContext: StreamContext }
   | { type: 'content.ready' }
   | {
       type: 'overlay.subtitle';
@@ -60,10 +72,18 @@ export type ExtensionMessage =
   | { type: 'overlay.status'; status: SessionStatus; message?: string }
   | { type: 'overlay.updateSettings'; settings: Partial<UserSettings> }
   | { type: 'session.state'; snapshot: SessionSnapshot }
-  | { type: 'offscreen.start'; streamId: string; sessionId: string; targetLanguage: LanguageCode; apiBase: string }
+  | {
+      type: 'offscreen.start';
+      streamId: string;
+      sessionId: string;
+      targetLanguage: LanguageCode;
+      apiBase: string;
+      streamContext?: StreamContext;
+    }
   | { type: 'offscreen.stop' }
   | { type: 'offscreen.status'; status: SessionStatus; message?: string }
   | { type: 'offscreen.serverEvent'; event: ServerEvent }
+  | { type: 'offscreen.streamContext'; streamContext: StreamContext }
   | { type: 'offscreen.error'; code: AppErrorCode; message: string }
   | { type: 'dev.ping' };
 

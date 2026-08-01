@@ -12,6 +12,7 @@ type StartOptions = {
   sessionId: string;
   targetLanguage: LanguageCode;
   platform?: 'twitch';
+  streamContext?: import('@live-translator/protocol').StreamContext;
 };
 
 /**
@@ -71,6 +72,18 @@ export class RealtimeClient {
     this.audioRing.length = 0;
   }
 
+  updateStreamContext(streamContext: import('@live-translator/protocol').StreamContext): void {
+    if (!this.options) return;
+    this.options.streamContext = streamContext;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.started) return;
+    const event: ClientEvent = {
+      type: 'stream.context.update',
+      sessionId: this.options.sessionId,
+      streamContext,
+    };
+    this.ws.send(JSON.stringify(event));
+  }
+
   private async connect(): Promise<void> {
     if (!this.options) return;
     this.callbacks.onStatus(this.attempt === 0 ? 'connecting' : 'reconnecting');
@@ -113,6 +126,7 @@ export class RealtimeClient {
           sampleRate: 16000,
           channels: 1,
           platform: this.options.platform ?? 'twitch',
+          streamContext: this.options.streamContext,
         };
         ws.send(JSON.stringify(startEvent));
         this.started = true;

@@ -1,0 +1,189 @@
+{
+  "id": "path-of-exile",
+  "displayName": "Path of Exile",
+  "aliases": [
+    "poe",
+    "po e",
+    "path of exile",
+    "path-of-exile",
+    "pathofexile"
+  ],
+  "contextDescription": "Action RPG with builds, skill gems, item crafting, mapping, leagues, bosses and character progression. Turkish PoE players keep most official names in English.",
+  "preserveTerms": [
+    "Chaos Orb",
+    "Divine Orb",
+    "Exalted Orb",
+    "Mirror of Kalandra",
+    "Mageblood",
+    "Headhunter",
+    "Atlas",
+    "Passive Tree",
+    "Ascendancy",
+    "Slayer",
+    "Juggernaut",
+    "Deadeye",
+    "Trickster",
+    "Maven",
+    "Shaper",
+    "Elder",
+    "Uber Elder",
+    "Sirus",
+    "Ground Slam",
+    "Static Strike",
+    "Vaal Ground Slam",
+    "Bleed",
+    "Impale",
+    "Leech",
+    "Fortify",
+    "Overwhelm",
+    "Ailment",
+    "DoT",
+    "DPS",
+    "Delve",
+    "Heist",
+    "Sanctum",
+    "Breach",
+    "Abyss",
+    "Essence",
+    "Fossil",
+    "Harvest",
+    "Betrayal",
+    "Syndicate",
+    "Legion",
+    "Unique",
+    "Rare",
+    "Magic",
+    "Normal",
+    "Tabula Rasa",
+    "Inquisitor",
+    "Hierophant",
+    "Champion",
+    "Gladiator",
+    "Assassin",
+    "Saboteur",
+    "Elementalist",
+    "Occultist",
+    "Necromancer",
+    "Pathfinder",
+    "Raider",
+    "Warden",
+    "Chieftain",
+    "Berserker",
+    "Guardian",
+    "Ascendant"
+  ],
+  "preferredTranslations": {
+    "mapping": "map dönmek",
+    "bossing": "boss kesmek",
+    "crafting": "craft yapmak",
+    "respec": "respec atmak",
+    "leveling": "level kasmak",
+    "farming": "farm yapmak",
+    "drop": "drop",
+    "clear speed": "clear hızı",
+    "league starter": "league starter build",
+    "damage": "hasar",
+    "attack speed": "saldırı hızı",
+    "cast speed": "cast hızı",
+    "movement speed": "hareket hızı",
+    "life": "can",
+    "energy shield": "energy shield",
+    "armour": "armor",
+    "evasion": "evasion",
+    "resistance": "direnç",
+    "resistances": "dirençler",
+    "currency": "currency",
+    "trade": "trade",
+    "hideout": "hideout",
+    "lab": "lab",
+    "labyrinth": "labyrinth",
+    "pantheon": "pantheon",
+    "bandit": "bandit",
+    "act": "act",
+    "campaign": "campaign",
+    "endgame": "endgame",
+    "league": "league",
+    "softcore": "softcore",
+    "hardcore": "hardcore",
+    "ssf": "SSF",
+    "trade league": "trade league"
+  },
+  "contextualTerms": [
+    {
+      "term": "build",
+      "meaning": "Character setup of skills, items, passive tree and progression.",
+      "preferredTranslation": "build",
+      "aliases": ["builds"]
+    },
+    {
+      "term": "map",
+      "meaning": "Endgame area item and activity.",
+      "preferredTranslation": "map",
+      "aliases": ["maps"]
+    },
+    {
+      "term": "bleed",
+      "meaning": "A damage-over-time ailment.",
+      "preferredTranslation": "bleed",
+      "preserve": true
+    },
+    {
+      "term": "gem",
+      "meaning": "Skill or support gem socketed into items.",
+      "preferredTranslation": "gem",
+      "aliases": ["gems", "skill gem", "support gem"]
+    },
+    {
+      "term": "tree",
+      "meaning": "The passive skill tree.",
+      "preferredTranslation": "tree"
+    },
+    {
+      "term": "craft",
+      "meaning": "Item modification via crafting systems.",
+      "preferredTranslation": "craft",
+      "aliases": ["crafting"]
+    }
+  ],
+  "styleRules": [
+    "Use natural Turkish PoE community phrasing.",
+    "Keep skill gem names in English.",
+    "Keep unique item names in English.",
+    "Keep boss and NPC names in English.",
+    "Keep currency names in English.",
+    "Keep ascendancy names in English.",
+    "Prefer 'map dönmek' for mapping activities.",
+    "Prefer 'boss kesmek' for bossing.",
+    "Do not invent Turkish names for skills or uniques."
+  ],
+  "examples": [
+    {
+      "source": "We are going to do some mapping.",
+      "target": "Biraz map döneceğiz."
+    },
+    {
+      "source": "This build is really strong for bossing.",
+      "target": "Bu build boss kesmek için gerçekten güçlü."
+    },
+    {
+      "source": "I need one more Divine Orb.",
+      "target": "Bir Divine Orb daha lazım."
+    },
+    {
+      "source": "Ground Slam is better for clear speed.",
+      "target": "Ground Slam clear hızı için daha iyi."
+    },
+    {
+      "source": "We are mapping for a while.",
+      "target": "Biraz map döneceğiz."
+    },
+    {
+      "source": "We are going mapping and then fighting Maven.",
+      "target": "Map dönüp sonra Maven'la savaşacağız."
+    }
+  ],
+  "metadata": {
+    "version": 1,
+    "updatedAt": "2026-08-01"
+  }
+}

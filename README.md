@@ -117,7 +117,67 @@ You can also exercise the backend alone:
 pnpm --filter @live-translator/server test
 ```
 
-## Real provider configuration
+## Game-aware translation
+
+Live Translator detects the Twitch category/game and applies a terminology profile so subtitles sound like natural Turkish gaming speech — without translating official names like `Ground Slam` into awkward dictionary Turkish.
+
+### How detection works
+
+1. The Twitch adapter reads category metadata from the page (`stream-game-link`, title fallbacks).
+2. `streamContext` is sent on `session.start` and updated via `stream.context.update` on SPA navigation / category changes.
+3. The server resolves the game through deterministic aliases (no LLM).
+4. A matching profile is loaded from memory cache (or `generic-gaming` as fallback).
+
+### Profile selection
+
+```text
+Exact / alias match → specialized profile
+Else → generic-gaming
+```
+
+Current profiles:
+
+- `generic-gaming`
+- `path-of-exile` (detailed starter)
+- `league-of-legends`
+- `valorant`
+- `counter-strike-2`
+
+Profiles live in `apps/server/src/game-context/profiles/`.
+
+### Preserve vs preferred translation
+
+| Behavior | Example | Result |
+| --- | --- | --- |
+| Preserve | `Divine Orb`, `Ground Slam` | Keep English exactly |
+| Preferred | `mapping` → `map dönmek` | Community phrasing |
+| Contextual | `build` in PoE | Stay as `build` |
+
+### Translation memory
+
+Per-session memory keeps terminology consistent. Priority:
+
+```text
+User → Game profile → Community → Session memory → Provider
+```
+
+(MVP implements profile + session memory; user/community are data-model ready.)
+
+### Add a new game profile
+
+1. Create `apps/server/src/game-context/profiles/my-game.json` matching the Zod schema.
+2. Register it in `profiles/index.ts`.
+3. Add aliases that match Twitch category names.
+4. Restart the server — invalid profiles fail loudly at startup.
+
+### Test game-aware translation
+
+```bash
+pnpm --filter @live-translator/server test
+```
+
+Manual: open a Path of Exile Twitch stream, start translation, confirm popup shows `Path of Exile context active` and terms like `Ground Slam` stay English.
+
 
 ### Speech-to-text
 

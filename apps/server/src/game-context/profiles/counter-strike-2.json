@@ -1,0 +1,54 @@
+{
+  "id": "counter-strike-2",
+  "displayName": "Counter-Strike 2",
+  "aliases": ["cs2", "cs 2", "counter-strike 2", "counter strike 2", "csgo", "cs:go"],
+  "contextDescription": "Tactical FPS with economy, utility, and competitive map play.",
+  "preserveTerms": [
+    "AK-47",
+    "AWP",
+    "M4A1",
+    "M4A4",
+    "Deagle",
+    "Flash",
+    "Smoke",
+    "Molotov",
+    "HE",
+    "Mirage",
+    "Dust2",
+    "Inferno",
+    "Nuke",
+    "Ancient",
+    "Anubis"
+  ],
+  "preferredTranslations": {
+    "eco": "eco",
+    "force": "force",
+    "full buy": "full buy",
+    "entry": "entry",
+    "lurk": "lurk",
+    "rotate": "rotate",
+    "clutch": "clutch",
+    "utility": "utility"
+  },
+  "contextualTerms": [
+    {
+      "term": "eco",
+      "meaning": "Low-economy round.",
+      "preferredTranslation": "eco"
+    }
+  ],
+  "styleRules": [
+    "Keep weapon and map names in English.",
+    "Use Turkish CS community phrasing."
+  ],
+  "examples": [
+    {
+      "source": "Let's force this round.",
+      "target": "Bu round force atalım."
+    }
+  ],
+  "metadata": {
+    "version": 1,
+    "updatedAt": "2026-08-01"
+  }
+}

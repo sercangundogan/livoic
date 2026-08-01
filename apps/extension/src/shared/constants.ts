@@ -24,4 +24,5 @@ export const STORAGE_SESSION_KEYS = {
   lastError: 'lastError',
   userId: 'userId',
   audioSecondsToday: 'audioSecondsToday',
+  gameContext: 'gameContext',
 } as const;

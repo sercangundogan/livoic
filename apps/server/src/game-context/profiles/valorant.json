@@ -1,0 +1,56 @@
+{
+  "id": "valorant",
+  "displayName": "Valorant",
+  "aliases": ["valorant", "val"],
+  "contextDescription": "Tactical FPS with agents, abilities, and round-based gunplay.",
+  "preserveTerms": [
+    "Vandal",
+    "Phantom",
+    "Operator",
+    "Sheriff",
+    "Jett",
+    "Omen",
+    "Sova",
+    "Killjoy",
+    "Spike",
+    "Ultimate"
+  ],
+  "preferredTranslations": {
+    "agent": "ajan",
+    "eco": "eco",
+    "full buy": "full buy",
+    "force buy": "force",
+    "plant": "plant",
+    "defuse": "defuse",
+    "clutch": "clutch",
+    "entry": "entry"
+  },
+  "contextualTerms": [
+    {
+      "term": "agent",
+      "meaning": "Playable character in Valorant.",
+      "preferredTranslation": "ajan"
+    },
+    {
+      "term": "ult",
+      "meaning": "Ultimate ability.",
+      "preferredTranslation": "ulti",
+      "aliases": ["ultimate"]
+    }
+  ],
+  "styleRules": [
+    "Keep weapon and agent names in English.",
+    "Use Turkish Valorant community phrasing.",
+    "Prefer 'ajan' for agent when natural."
+  ],
+  "examples": [
+    {
+      "source": "I need a Vandal this round.",
+      "target": "Bu round Vandal almam lazım."
+    }
+  ],
+  "metadata": {
+    "version": 1,
+    "updatedAt": "2026-08-01"
+  }
+}
