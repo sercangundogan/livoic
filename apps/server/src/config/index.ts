@@ -27,6 +27,7 @@ const ConfigSchema = z.object({
   CHUNK_DURATION_MS: z.coerce.number().default(100),
   OPENAI_API_KEY: z.string().optional(),
   DEEPGRAM_API_KEY: z.string().optional(),
+  DEEPGRAM_MODEL: z.string().default('nova-2'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

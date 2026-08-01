@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import type { IncomingMessage } from 'node:http';
 import type { SpeechSessionOptions, SpeechToTextProvider, TranscriptEvent } from '../speech-provider.js';
 
 type DeepgramResultsMessage = {
@@ -23,8 +24,8 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
   private options?: SpeechSessionOptions;
   private closed = false;
   private segmentIndex = 0;
+  private currentSegmentId = '';
   private keepAliveTimer?: ReturnType<typeof setInterval>;
-  private connectPromise?: Promise<void>;
 
   constructor(
     private readonly apiKey: string,
@@ -38,7 +39,9 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
     this.options = options;
     this.closed = false;
     this.segmentIndex = 0;
+    this.currentSegmentId = this.nextSegmentId();
 
+    // Keep query params conservative — detect_language causes HTTP 400 on many model combos.
     const params = new URLSearchParams({
       model: this.model,
       encoding: 'linear16',
@@ -47,18 +50,32 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
       interim_results: 'true',
       punctuate: 'true',
       smart_format: 'true',
-      endpointing: '300',
+      vad_events: 'true',
+      utterance_end_ms: '1000',
     });
 
-    if (options.sourceLanguage && options.sourceLanguage !== 'auto') {
-      params.set('language', options.sourceLanguage);
-    } else {
-      params.set('language', 'multi');
-    }
+    const language =
+      options.sourceLanguage && options.sourceLanguage !== 'auto'
+        ? options.sourceLanguage
+        : 'en';
+    params.set('language', language);
 
     const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
-    this.connectPromise = new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        this.errorCb?.(error);
+        reject(error);
+      };
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
       const ws = new WebSocket(url, {
         headers: {
           Authorization: `Token ${this.apiKey}`,
@@ -66,29 +83,37 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
       });
       this.ws = ws;
 
-      ws.on('open', () => {
+      ws.once('open', () => {
         this.startKeepAlive();
-        resolve();
+        succeed();
       });
 
       ws.on('message', (data) => {
         this.handleMessage(data.toString());
       });
 
-      ws.on('error', (err) => {
-        this.errorCb?.(err instanceof Error ? err : new Error(String(err)));
-        reject(err);
+      ws.on('unexpected-response', (_req, res: IncomingMessage) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8').slice(0, 500);
+          fail(new Error(`Deepgram HTTP ${res.statusCode}: ${body || 'no body'}`));
+        });
+      });
+
+      ws.once('error', (err) => {
+        fail(err instanceof Error ? err : new Error(String(err)));
       });
 
       ws.on('close', () => {
         this.clearKeepAlive();
-        if (!this.closed) {
+        if (!this.closed && !settled) {
+          fail(new Error('Deepgram connection closed before open'));
+        } else if (!this.closed) {
           this.errorCb?.(new Error('Deepgram connection closed unexpectedly'));
         }
       });
     });
-
-    await this.connectPromise;
   }
 
   sendAudio(chunk: Buffer): void {
@@ -135,28 +160,34 @@ export class DeepgramSpeechProvider implements SpeechToTextProvider {
     const transcript = message.channel?.alternatives?.[0]?.transcript?.trim();
     if (!transcript) return;
 
-    const segmentId = `dg-${this.options?.sessionId.slice(0, 8)}-${this.segmentIndex}`;
     const startMs = Math.round((message.start ?? 0) * 1000);
     const endMs = Math.round(((message.start ?? 0) + (message.duration ?? 0)) * 1000);
 
     if (message.is_final) {
       this.finalCb?.({
-        segmentId,
+        segmentId: this.currentSegmentId,
         text: transcript,
         isFinal: true,
+        language: 'en',
         startMs,
         endMs,
       });
       this.segmentIndex += 1;
+      this.currentSegmentId = this.nextSegmentId();
     } else {
       this.partialCb?.({
-        segmentId,
+        segmentId: this.currentSegmentId,
         text: transcript,
         isFinal: false,
+        language: 'en',
         startMs,
         endMs,
       });
     }
+  }
+
+  private nextSegmentId(): string {
+    return `dg-${this.options?.sessionId.slice(0, 8) ?? 'sess'}-${this.segmentIndex}`;
   }
 
   private startKeepAlive(): void {

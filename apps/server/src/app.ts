@@ -18,6 +18,8 @@ export async function buildApp(config: AppConfig) {
     usage,
     logger,
     config.OPENAI_API_KEY,
+    config.DEEPGRAM_API_KEY,
+    config.DEEPGRAM_MODEL,
   );
 
   const app = Fastify({
@@ -40,6 +42,9 @@ export async function buildApp(config: AppConfig) {
       activeSessions: sessions.size(),
       speechProvider: config.SPEECH_PROVIDER,
       translationProvider: config.TRANSLATION_PROVIDER,
+      hasOpenAiKey: Boolean(config.OPENAI_API_KEY),
+      hasDeepgramKey: Boolean(config.DEEPGRAM_API_KEY),
+      deepgramModel: config.DEEPGRAM_MODEL,
       devAuthMode: config.DEV_AUTH_MODE,
     };
   });

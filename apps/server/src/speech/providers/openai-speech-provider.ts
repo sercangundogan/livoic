@@ -98,7 +98,7 @@ export class OpenAiWhisperSpeechProvider implements SpeechToTextProvider {
       });
 
       const form = new FormData();
-      form.append('file', new Blob([wav], { type: 'audio/wav' }), 'chunk.wav');
+      form.append('file', new Blob([new Uint8Array(wav)], { type: 'audio/wav' }), 'chunk.wav');
       form.append('model', this.model);
       form.append('response_format', 'json');
       if (this.options?.sourceLanguage && this.options.sourceLanguage !== 'auto') {

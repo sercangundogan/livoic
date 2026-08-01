@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { SpeechSessionOptions, SpeechToTextProvider, TranscriptEvent } from './speech-provider.js';
 
 const SAMPLE_SEGMENTS = [
@@ -65,7 +64,6 @@ export class MockSpeechProvider implements SpeechToTextProvider {
     const elapsed = Date.now() - this.startedAt;
     const words = text.split(' ');
 
-    // Emit a partial with first half of words
     const partialText = words.slice(0, Math.ceil(words.length / 2)).join(' ');
     this.partialCb?.({
       segmentId,
@@ -88,15 +86,6 @@ export class MockSpeechProvider implements SpeechToTextProvider {
     }, 600);
 
     this.segmentIndex += 1;
-    // Soft-reset so we need more audio before next emission
     this.audioBytes = Math.floor(this.audioBytes * 0.2);
   }
-}
-
-export function createSpeechProvider(name: string): SpeechToTextProvider {
-  if (name === 'openai' || name === 'deepgram') {
-    // Real streaming adapters live under ./providers — fall back to mock until keys are configured.
-    void randomUUID();
-  }
-  return new MockSpeechProvider();
 }

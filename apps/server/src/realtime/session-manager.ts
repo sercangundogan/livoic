@@ -1,6 +1,6 @@
 import type { WebSocket } from 'ws';
 import type { Logger } from '../observability/logger.js';
-import { createSpeechProvider } from '../speech/mock-speech-provider.js';
+import { createSpeechProvider } from '../speech/create-speech-provider.js';
 import { createTranslationProvider } from '../translation/mock-translation-provider.js';
 import type { UsageStore } from '../usage/usage-store.js';
 import { TranslationSession } from './translation-session.js';
@@ -14,6 +14,8 @@ export class SessionManager {
     private readonly usage: UsageStore,
     private readonly logger: Logger,
     private readonly openaiApiKey?: string,
+    private readonly deepgramApiKey?: string,
+    private readonly deepgramModel?: string,
   ) {}
 
   getOrCreate(sessionId: string, userId: string, socket: WebSocket): TranslationSession {
@@ -27,7 +29,12 @@ export class SessionManager {
       sessionId,
       userId,
       socket,
-      speech: createSpeechProvider(this.speechProviderName),
+      speech: createSpeechProvider({
+        name: this.speechProviderName,
+        openaiApiKey: this.openaiApiKey,
+        deepgramApiKey: this.deepgramApiKey,
+        deepgramModel: this.deepgramModel,
+      }),
       translation: createTranslationProvider(this.translationProviderName, this.openaiApiKey),
       usage: this.usage,
       logger: this.logger,

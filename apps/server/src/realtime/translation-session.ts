@@ -136,6 +136,8 @@ export class TranslationSession {
     });
 
     this.speech.onFinal(async (final) => {
+      if (!final.text.trim()) return;
+
       this.send({
         type: 'transcript.final',
         sessionId: this.sessionId,
@@ -208,12 +210,30 @@ export class TranslationSession {
       });
     });
 
-    await this.speech.connect({
-      sessionId: this.sessionId,
-      sourceLanguage: event.sourceLanguage,
-      sampleRate: event.sampleRate,
-      channels: event.channels,
-    });
+    try {
+      await this.speech.connect({
+        sessionId: this.sessionId,
+        sourceLanguage: event.sourceLanguage,
+        sampleRate: event.sampleRate,
+        channels: event.channels,
+      });
+    } catch (error) {
+      this.started = false;
+      this.logger.error('speech_connect_failed', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : 'unknown',
+      });
+      this.send({
+        type: 'error',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        code: 'PROVIDER_UNAVAILABLE',
+        message: 'Live translation is temporarily unavailable.',
+        recoverable: true,
+      });
+      return;
+    }
 
     this.send({
       type: 'session.ready',
