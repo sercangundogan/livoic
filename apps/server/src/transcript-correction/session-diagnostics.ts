@@ -47,6 +47,12 @@ export type SegmentTranscriptDiagnostics = {
   route?: 'game-aware' | 'general' | 'conservative';
   gameContextAttached?: boolean;
   classificationLatencyMs?: number;
+  /** Sentence assembly (when enabled). */
+  assemblyId?: string;
+  assemblySourceSegmentCount?: number;
+  assemblyMergeCount?: number;
+  assemblyMerged?: boolean;
+  assemblyFlushReason?: string;
 };
 
 export type SessionTranscriptMetrics = {

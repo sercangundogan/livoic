@@ -45,6 +45,13 @@ import {
   type TranscriptTopic,
   type TranslationRoute,
 } from '../topic-routing/index.js';
+import {
+  SentenceAssemblyService,
+  loadSentenceAssemblyConfig,
+  type AssembledUtterance,
+  type RawTranscriptSegment,
+  type SentenceAssemblyRuntimeConfig,
+} from '../sentence-assembly/index.js';
 
 export type TranslationSessionOptions = {
   sessionId: string;
@@ -59,6 +66,7 @@ export type TranslationSessionOptions = {
   openaiApiKey?: string;
   sampleRate?: number;
   topicRouting?: TopicRoutingRuntimeConfig;
+  sentenceAssembly?: SentenceAssemblyRuntimeConfig;
 };
 
 const PREVIOUS_TOPIC_SEGMENTS_MAX = 10;
@@ -86,6 +94,8 @@ export class TranslationSession {
   private readonly topicState: TopicStateManager;
   private readonly topicHistory: TopicContextHistoryStore;
   private readonly routedMemory = new RoutedTranslationMemory();
+  private readonly sentenceAssemblyConfig: SentenceAssemblyRuntimeConfig;
+  private sentenceAssembly: SentenceAssemblyService;
   private previousTopicSegments: Array<{ text: string; topic?: TranscriptTopic }> = [];
   private generalRouteLeakageCount = 0;
   private audioBuffer: AudioRingBuffer;
@@ -100,6 +110,7 @@ export class TranslationSession {
   private audioBytes = 0;
   private lastUsageEmit = 0;
   private closed = false;
+  private assembledQueue: Promise<void> = Promise.resolve();
 
   constructor(options: TranslationSessionOptions) {
     this.sessionId = options.sessionId;
@@ -133,6 +144,12 @@ export class TranslationSession {
     );
     this.correctionService = new TranscriptCorrectionService(this.transcriptStore);
     this.diagnosticsEnabled = process.env.NODE_ENV !== 'production';
+    this.sentenceAssemblyConfig = options.sentenceAssembly ?? loadSentenceAssemblyConfig();
+    this.sentenceAssembly = new SentenceAssemblyService(
+      this.sentenceAssemblyConfig,
+      (utterance) => this.enqueueAssembledUtterance(utterance),
+      { sessionId: this.sessionId },
+    );
   }
 
   /** Development-only transcript segment diagnostics (includes text). Empty in production. */
@@ -218,6 +235,7 @@ export class TranslationSession {
     this.gameProfile = profile;
 
     if (previousGameId && previousGameId !== resolvedGame.gameId) {
+      void this.sentenceAssembly.flushThenClear('game-change');
       this.memory.clearGameSpecific(true);
       this.context.clear();
       this.topicState.resetForGameChange();
@@ -695,6 +713,403 @@ export class TranslationSession {
     return refined.confidence > preliminary.confidence || refinedMargin > preliminaryMargin;
   }
 
+  private enqueueAssembledUtterance(assembled: AssembledUtterance): Promise<void> {
+    this.assembledQueue = this.assembledQueue
+      .then(() => this.processAssembledUtterance(assembled))
+      .catch((error) => {
+        this.logger.error('sentence_assembly.process_failed', {
+          sessionId: this.sessionId,
+          assembledId: assembled.id,
+          error: error instanceof Error ? error.message : 'unknown',
+        });
+      });
+    return this.assembledQueue;
+  }
+
+  private async processAssembledUtterance(assembled: AssembledUtterance): Promise<void> {
+    if (this.closed) return;
+
+    const pipelineStarted = Date.now();
+    const routingEnabled = this.topicRoutingConfig.enabled;
+    const rawText = assembled.rawText;
+    const segmentId =
+      assembled.sourceSegmentIds.length > 1
+        ? assembled.sourceSegmentIds.join('+')
+        : (assembled.sourceSegmentIds[0] ?? assembled.id);
+    const translationSegmentId = assembled.sourceSegmentIds[0] ?? assembled.id;
+    const startMs = assembled.startMs;
+    const endMs = assembled.endMs;
+    const preliminaryTopic = assembled.preliminaryTopics[0];
+
+    const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
+    if (this.retranscriber instanceof MockRetranscriber) {
+      this.retranscriber.pendingRaw = rawText;
+    }
+
+    const correction = await this.correctionService.correctFinalSegment({
+      segmentId,
+      rawText,
+      confidence: undefined,
+      startMs,
+      endMs,
+      profile,
+      sampleRate: this.sampleRate,
+      audioBuffer: this.audioBuffer,
+      retranscriber: this.retranscriber,
+      confidenceThreshold: this.correctionConfig.confidenceThreshold,
+      retranscribeTimeoutMs: this.correctionConfig.retranscribeTimeoutMs,
+      enabled: this.correctionConfig.enabled,
+      skipPhoneticNormalization: routingEnabled,
+    });
+
+    if (this.closed) return;
+
+    this.logger.info('transcript_correction.completed', {
+      sessionId: this.sessionId,
+      segmentId,
+      assembledId: assembled.id,
+      rawLength: correction.rawText.length,
+      correctedLength: correction.correctedText?.length ?? 0,
+      usedCorrected: Boolean(correction.correctedText),
+      retranscribed: correction.retranscribed,
+      normalized: correction.normalized,
+      timedOut: correction.timedOut,
+      isLowConfidence: correction.evaluation.isLowConfidence,
+      shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+      correctionSource: correction.correctionSource,
+      retranscribeLatencyMs: correction.retranscribeLatencyMs,
+      normalizeLatencyMs: correction.normalizeLatencyMs,
+      reasonCount: correction.evaluation.reasons.length,
+      confidenceMissing: true,
+      skipPhoneticNormalization: routingEnabled,
+    });
+
+    let textForTranslation = correction.textForTranslation;
+    let classification: TopicClassificationResult | undefined;
+    let route: TranslationRoute | undefined;
+    let classificationLatencyMs: number | undefined;
+    let gameContextAttached = true;
+    let activeTopic: TranscriptTopic | undefined;
+    let routeNormalizeLatencyMs = 0;
+
+    if (routingEnabled) {
+      const classifyStarted = Date.now();
+      const usableText = correction.textForTranslation;
+      const resolved =
+        this.resolvedGame ??
+        this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
+
+      const finalClassification = this.topicClassifier.classify({
+        currentText: usableText,
+        previousSegments: this.previousTopicSegments,
+        streamContext: this.streamContext
+          ? {
+              gameName: this.streamContext.gameName,
+              streamTitle: this.streamContext.streamTitle,
+              channelName: this.streamContext.channelName,
+            }
+          : undefined,
+        gameContext: {
+          gameId: resolved.gameId,
+          displayName: resolved.displayName,
+          confidence: resolved.confidence,
+        },
+        gameProfile: profile,
+        activeTopicState: this.topicState.getState(),
+      });
+
+      this.topicState.update(finalClassification);
+      route = this.topicRouting.resolveRoute(finalClassification, this.topicState.getState());
+
+      let normalized = normalizeForRoute(usableText, route, profile);
+      routeNormalizeLatencyMs = normalized.normalizeLatencyMs;
+      classification = finalClassification;
+
+      if (finalClassification.topic === 'uncertain' && normalized.text !== usableText) {
+        const refined = this.topicClassifier.classify({
+          currentText: normalized.text,
+          correctedText: normalized.text,
+          previousSegments: this.previousTopicSegments,
+          streamContext: this.streamContext
+            ? {
+                gameName: this.streamContext.gameName,
+                streamTitle: this.streamContext.streamTitle,
+                channelName: this.streamContext.channelName,
+              }
+            : undefined,
+          gameContext: {
+            gameId: resolved.gameId,
+            displayName: resolved.displayName,
+            confidence: resolved.confidence,
+          },
+          gameProfile: profile,
+          activeTopicState: this.topicState.getState(),
+        });
+
+        if (this.shouldPreferRefinedClassification(finalClassification, refined)) {
+          this.topicState.update(refined);
+          const refinedRoute = this.topicRouting.resolveRoute(
+            refined,
+            this.topicState.getState(),
+          );
+          classification = refined;
+          if (refinedRoute !== route) {
+            route = refinedRoute;
+            normalized = normalizeForRoute(usableText, route, profile);
+            routeNormalizeLatencyMs += normalized.normalizeLatencyMs;
+          }
+        }
+      }
+
+      textForTranslation = normalized.text;
+      classificationLatencyMs = Date.now() - classifyStarted;
+      activeTopic = this.topicState.getState().currentTopic;
+
+      if (this.closed) return;
+
+      const translation = await this.translateSegment({
+        segmentId: translationSegmentId,
+        text: textForTranslation,
+        startMs,
+        endMs,
+        route,
+      });
+      gameContextAttached = translation.gameContextAttached;
+
+      const topicForHistory: TranscriptTopic =
+        classification.topic === 'uncertain'
+          ? this.topicState.inheritTopicForUncertain(classification)
+          : classification.topic;
+
+      this.topicHistory.push({
+        text: textForTranslation,
+        topic: topicForHistory,
+        route,
+        at: Date.now(),
+      });
+      this.previousTopicSegments.push({
+        text: textForTranslation,
+        topic: classification.topic,
+      });
+      if (this.previousTopicSegments.length > PREVIOUS_TOPIC_SEGMENTS_MAX) {
+        this.previousTopicSegments.shift();
+      }
+
+      this.logger.info('topic_routing.completed', {
+        sessionId: this.sessionId,
+        segmentId,
+        assembledId: assembled.id,
+        topic: classification.topic,
+        route,
+        confidence: classification.confidence,
+        gameScore: classification.gameScore,
+        generalScore: classification.generalScore,
+        reasons: classification.reasons,
+        matchedGameTermCount: classification.matchedGameTerms.length,
+        matchedGeneralSignalCount: classification.matchedGeneralSignals.length,
+        activeTopic,
+        gameContextAttached,
+        generalRouteLeakageCount: this.generalRouteLeakageCount,
+        latencyMs: classificationLatencyMs,
+      });
+
+      this.logger.info('sentence_assembly.completed', {
+        sessionId: this.sessionId,
+        assembledId: assembled.id,
+        sourceSegmentCount: assembled.sourceSegmentIds.length,
+        merged: assembled.mergeCount > 0,
+        mergeCount: assembled.mergeCount,
+        flushReason: assembled.flushReason,
+        preliminaryTopic,
+        finalTopic: classification.topic,
+        route,
+      });
+
+      const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
+      const wordConfidenceSummary = summarizeWordConfidence(
+        undefined,
+        this.correctionConfig.confidenceThreshold,
+      );
+      const assemblyFields = {
+        assemblySourceSegmentCount: assembled.sourceSegmentIds.length,
+        assemblyMergeCount: assembled.mergeCount,
+        assemblyMerged: assembled.mergeCount > 0,
+        assemblyFlushReason: assembled.flushReason,
+        assemblyId: assembled.id,
+      };
+
+      this.diagnostics.record(
+        {
+          segmentId,
+          rawTranscript: correction.rawText,
+          retranscribedTranscript: correction.retranscribedText,
+          correctedTranscript: correction.correctedText,
+          translatedText: translation.translatedText,
+          sttConfidence: undefined,
+          wordConfidenceSummary,
+          qualityScore: correction.evaluation.score,
+          qualityReasons: correction.evaluation.reasons,
+          shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+          correctionSource: correction.correctionSource,
+          retranscribeLatencyMs: correction.retranscribeLatencyMs,
+          normalizeLatencyMs: correction.normalizeLatencyMs + routeNormalizeLatencyMs,
+          translationLatencyMs: translation.latencyMs,
+          totalSubtitleLatencyMs,
+          timedOut: correction.timedOut,
+          confidenceMissing: true,
+          topic: classification.topic,
+          topicConfidence: classification.confidence,
+          gameScore: classification.gameScore,
+          generalScore: classification.generalScore,
+          topicReasons: classification.reasons,
+          matchedGameTerms: classification.matchedGameTerms,
+          matchedGeneralSignals: classification.matchedGeneralSignals,
+          activeTopic,
+          route,
+          gameContextAttached,
+          classificationLatencyMs,
+          ...assemblyFields,
+        },
+        correction.evaluation,
+      );
+
+      const metrics = this.diagnostics.getMetrics();
+      for (const warning of metrics.warnings) {
+        this.logger.warn('transcript_correction_metric_warning', {
+          sessionId: this.sessionId,
+          warning,
+          totalFinalizedSegments: metrics.totalFinalizedSegments,
+          retranscriptionRate: metrics.retranscriptionRate,
+          averageLowConfidencePathLatencyMs: metrics.averageLowConfidencePathLatencyMs,
+        });
+      }
+
+      if (this.diagnosticsEnabled) {
+        this.logger.debug('transcript_segment_diagnostics', {
+          sessionId: this.sessionId,
+          segmentId,
+          rawTranscript: correction.rawText,
+          retranscribedTranscript: correction.retranscribedText,
+          correctedTranscript: correction.correctedText,
+          translatedText: translation.translatedText,
+          sttConfidence: undefined,
+          wordConfidenceAvailable: wordConfidenceSummary.available,
+          wordConfidenceAvg: wordConfidenceSummary.avg,
+          qualityScore: correction.evaluation.score,
+          qualityReasons: correction.evaluation.reasons,
+          shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+          correctionSource: correction.correctionSource,
+          retranscribeLatencyMs: correction.retranscribeLatencyMs,
+          normalizeLatencyMs: correction.normalizeLatencyMs + routeNormalizeLatencyMs,
+          translationLatencyMs: translation.latencyMs,
+          totalSubtitleLatencyMs,
+          topic: classification.topic,
+          route,
+          topicConfidence: classification.confidence,
+          gameScore: classification.gameScore,
+          generalScore: classification.generalScore,
+          topicReasons: classification.reasons,
+          activeTopic,
+          gameContextAttached,
+          ...assemblyFields,
+        });
+      }
+      return;
+    }
+
+    if (this.closed) return;
+
+    const translation = await this.translateSegment({
+      segmentId: translationSegmentId,
+      text: textForTranslation,
+      startMs,
+      endMs,
+    });
+    gameContextAttached = translation.gameContextAttached;
+
+    this.logger.info('sentence_assembly.completed', {
+      sessionId: this.sessionId,
+      assembledId: assembled.id,
+      sourceSegmentCount: assembled.sourceSegmentIds.length,
+      merged: assembled.mergeCount > 0,
+      mergeCount: assembled.mergeCount,
+      flushReason: assembled.flushReason,
+      preliminaryTopic,
+      finalTopic: undefined,
+    });
+
+    const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
+    const wordConfidenceSummary = summarizeWordConfidence(
+      undefined,
+      this.correctionConfig.confidenceThreshold,
+    );
+    const assemblyFields = {
+      assemblySourceSegmentCount: assembled.sourceSegmentIds.length,
+      assemblyMergeCount: assembled.mergeCount,
+      assemblyMerged: assembled.mergeCount > 0,
+      assemblyFlushReason: assembled.flushReason,
+      assemblyId: assembled.id,
+    };
+
+    this.diagnostics.record(
+      {
+        segmentId,
+        rawTranscript: correction.rawText,
+        retranscribedTranscript: correction.retranscribedText,
+        correctedTranscript: correction.correctedText,
+        translatedText: translation.translatedText,
+        sttConfidence: undefined,
+        wordConfidenceSummary,
+        qualityScore: correction.evaluation.score,
+        qualityReasons: correction.evaluation.reasons,
+        shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+        correctionSource: correction.correctionSource,
+        retranscribeLatencyMs: correction.retranscribeLatencyMs,
+        normalizeLatencyMs: correction.normalizeLatencyMs,
+        translationLatencyMs: translation.latencyMs,
+        totalSubtitleLatencyMs,
+        timedOut: correction.timedOut,
+        confidenceMissing: true,
+        ...assemblyFields,
+      },
+      correction.evaluation,
+    );
+
+    const metrics = this.diagnostics.getMetrics();
+    for (const warning of metrics.warnings) {
+      this.logger.warn('transcript_correction_metric_warning', {
+        sessionId: this.sessionId,
+        warning,
+        totalFinalizedSegments: metrics.totalFinalizedSegments,
+        retranscriptionRate: metrics.retranscriptionRate,
+        averageLowConfidencePathLatencyMs: metrics.averageLowConfidencePathLatencyMs,
+      });
+    }
+
+    if (this.diagnosticsEnabled) {
+      this.logger.debug('transcript_segment_diagnostics', {
+        sessionId: this.sessionId,
+        segmentId,
+        rawTranscript: correction.rawText,
+        retranscribedTranscript: correction.retranscribedText,
+        correctedTranscript: correction.correctedText,
+        translatedText: translation.translatedText,
+        sttConfidence: undefined,
+        wordConfidenceAvailable: wordConfidenceSummary.available,
+        wordConfidenceAvg: wordConfidenceSummary.avg,
+        qualityScore: correction.evaluation.score,
+        qualityReasons: correction.evaluation.reasons,
+        shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+        correctionSource: correction.correctionSource,
+        retranscribeLatencyMs: correction.retranscribeLatencyMs,
+        normalizeLatencyMs: correction.normalizeLatencyMs,
+        translationLatencyMs: translation.latencyMs,
+        totalSubtitleLatencyMs,
+        ...assemblyFields,
+      });
+    }
+  }
+
   private async start(event: SessionStartEvent): Promise<void> {
     if (this.started) return;
     this.started = true;
@@ -736,10 +1151,8 @@ export class TranslationSession {
 
     this.speech.onFinal(async (final) => {
       if (!final.text.trim()) return;
-      const pipelineStarted = Date.now();
-      const routingEnabled = this.topicRoutingConfig.enabled;
 
-      // Emit raw transcript (protocol unchanged)
+      // Emit raw transcript per STT fragment (protocol unchanged)
       this.send({
         type: 'transcript.final',
         sessionId: this.sessionId,
@@ -752,64 +1165,25 @@ export class TranslationSession {
         endMs: final.endMs,
       });
 
-      const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
-      if (this.retranscriber instanceof MockRetranscriber) {
-        this.retranscriber.pendingRaw = final.text;
-      }
-
-      const correction = await this.correctionService.correctFinalSegment({
+      const segment: RawTranscriptSegment = {
         segmentId: final.segmentId,
-        rawText: final.text,
-        confidence: final.confidence,
+        text: final.text,
         startMs: final.startMs,
         endMs: final.endMs,
+        confidence: final.confidence,
         language: final.language,
-        profile,
-        sampleRate: this.sampleRate,
-        audioBuffer: this.audioBuffer,
-        retranscriber: this.retranscriber,
-        confidenceThreshold: this.correctionConfig.confidenceThreshold,
-        retranscribeTimeoutMs: this.correctionConfig.retranscribeTimeoutMs,
-        enabled: this.correctionConfig.enabled,
-        skipPhoneticNormalization: routingEnabled,
-      });
+      };
 
-      this.logger.info('transcript_correction.completed', {
-        sessionId: this.sessionId,
-        segmentId: final.segmentId,
-        rawLength: correction.rawText.length,
-        correctedLength: correction.correctedText?.length ?? 0,
-        usedCorrected: Boolean(correction.correctedText),
-        retranscribed: correction.retranscribed,
-        normalized: correction.normalized,
-        timedOut: correction.timedOut,
-        isLowConfidence: correction.evaluation.isLowConfidence,
-        shouldRetranscribe: correction.evaluation.shouldRetranscribe,
-        correctionSource: correction.correctionSource,
-        retranscribeLatencyMs: correction.retranscribeLatencyMs,
-        normalizeLatencyMs: correction.normalizeLatencyMs,
-        reasonCount: correction.evaluation.reasons.length,
-        confidenceMissing: typeof final.confidence !== 'number',
-        skipPhoneticNormalization: routingEnabled,
-      });
-
-      let textForTranslation = correction.textForTranslation;
-      let classification: TopicClassificationResult | undefined;
-      let route: TranslationRoute | undefined;
-      let classificationLatencyMs: number | undefined;
-      let gameContextAttached = true;
-      let activeTopic: TranscriptTopic | undefined;
-      let routeNormalizeLatencyMs = 0;
+      const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
+      const routingEnabled = this.topicRoutingConfig.enabled;
+      let preliminaryTopic: TranscriptTopic = 'uncertain';
 
       if (routingEnabled) {
-        const classifyStarted = Date.now();
-        const usableText = correction.textForTranslation;
         const resolved =
           this.resolvedGame ??
           this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
-
         const preliminary = this.topicClassifier.classify({
-          currentText: usableText,
+          currentText: final.text,
           previousSegments: this.previousTopicSegments,
           streamContext: this.streamContext
             ? {
@@ -826,254 +1200,37 @@ export class TranslationSession {
           gameProfile: profile,
           activeTopicState: this.topicState.getState(),
         });
+        preliminaryTopic = preliminary.topic;
+        // Do not update topicState yet — wait for assembled utterance
+      }
 
-        this.topicState.update(preliminary);
-        route = this.topicRouting.resolveRoute(preliminary, this.topicState.getState());
+      const result = await this.sentenceAssembly.handleFinalSegment({
+        segment,
+        preliminaryTopic,
+      });
 
-        let normalized = normalizeForRoute(usableText, route, profile);
-        routeNormalizeLatencyMs = normalized.normalizeLatencyMs;
-        classification = preliminary;
+      const isProd = process.env.NODE_ENV === 'production';
+      this.logger.info('sentence_assembly.segment', {
+        sessionId: this.sessionId,
+        segmentId: final.segmentId,
+        action: result.action,
+        completeness: result.completeness?.completeness,
+        shouldHold: result.completeness?.shouldHold,
+        mergeScore: result.merge?.score,
+        mergeShouldMerge: result.merge?.shouldMerge,
+        mergeCountHint: result.assembled?.mergeCount,
+        flushReason: result.assembled?.flushReason,
+        hold: {
+          rawLength: final.text.length,
+          recommendedWaitMs: result.completeness?.recommendedWaitMs,
+        },
+        ...(isProd ? {} : { preliminaryTopic }),
+      });
 
-        if (preliminary.topic === 'uncertain' && normalized.text !== usableText) {
-          const refined = this.topicClassifier.classify({
-            currentText: normalized.text,
-            correctedText: normalized.text,
-            previousSegments: this.previousTopicSegments,
-            streamContext: this.streamContext
-              ? {
-                  gameName: this.streamContext.gameName,
-                  streamTitle: this.streamContext.streamTitle,
-                  channelName: this.streamContext.channelName,
-                }
-              : undefined,
-            gameContext: {
-              gameId: resolved.gameId,
-              displayName: resolved.displayName,
-              confidence: resolved.confidence,
-            },
-            gameProfile: profile,
-            activeTopicState: this.topicState.getState(),
-          });
-
-          if (this.shouldPreferRefinedClassification(preliminary, refined)) {
-            this.topicState.update(refined);
-            const refinedRoute = this.topicRouting.resolveRoute(
-              refined,
-              this.topicState.getState(),
-            );
-            classification = refined;
-            if (refinedRoute !== route) {
-              route = refinedRoute;
-              normalized = normalizeForRoute(usableText, route, profile);
-              routeNormalizeLatencyMs += normalized.normalizeLatencyMs;
-            }
-          }
-        }
-
-        textForTranslation = normalized.text;
-        classificationLatencyMs = Date.now() - classifyStarted;
-        activeTopic = this.topicState.getState().currentTopic;
-
-        const translation = await this.translateSegment({
-          segmentId: final.segmentId,
-          text: textForTranslation,
-          language: final.language,
-          startMs: final.startMs,
-          endMs: final.endMs,
-          route,
-        });
-        gameContextAttached = translation.gameContextAttached;
-
-        const topicForHistory: TranscriptTopic =
-          classification.topic === 'uncertain'
-            ? this.topicState.inheritTopicForUncertain(classification)
-            : classification.topic;
-
-        this.topicHistory.push({
-          text: textForTranslation,
-          topic: topicForHistory,
-          route,
-          at: Date.now(),
-        });
-        this.previousTopicSegments.push({
-          text: textForTranslation,
-          topic: classification.topic,
-        });
-        if (this.previousTopicSegments.length > PREVIOUS_TOPIC_SEGMENTS_MAX) {
-          this.previousTopicSegments.shift();
-        }
-
-        this.logger.info('topic_routing.completed', {
-          sessionId: this.sessionId,
-          segmentId: final.segmentId,
-          topic: classification.topic,
-          route,
-          confidence: classification.confidence,
-          gameScore: classification.gameScore,
-          generalScore: classification.generalScore,
-          reasons: classification.reasons,
-          matchedGameTermCount: classification.matchedGameTerms.length,
-          matchedGeneralSignalCount: classification.matchedGeneralSignals.length,
-          activeTopic,
-          gameContextAttached,
-          generalRouteLeakageCount: this.generalRouteLeakageCount,
-          latencyMs: classificationLatencyMs,
-        });
-
-        const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
-        const wordConfidenceSummary = summarizeWordConfidence(
-          final.words,
-          this.correctionConfig.confidenceThreshold,
-        );
-
-        this.diagnostics.record(
-          {
-            segmentId: final.segmentId,
-            rawTranscript: correction.rawText,
-            retranscribedTranscript: correction.retranscribedText,
-            correctedTranscript: correction.correctedText,
-            translatedText: translation.translatedText,
-            sttConfidence: final.confidence,
-            wordConfidenceSummary,
-            qualityScore: correction.evaluation.score,
-            qualityReasons: correction.evaluation.reasons,
-            shouldRetranscribe: correction.evaluation.shouldRetranscribe,
-            correctionSource: correction.correctionSource,
-            retranscribeLatencyMs: correction.retranscribeLatencyMs,
-            normalizeLatencyMs: correction.normalizeLatencyMs + routeNormalizeLatencyMs,
-            translationLatencyMs: translation.latencyMs,
-            totalSubtitleLatencyMs,
-            timedOut: correction.timedOut,
-            confidenceMissing: typeof final.confidence !== 'number',
-            topic: classification.topic,
-            topicConfidence: classification.confidence,
-            gameScore: classification.gameScore,
-            generalScore: classification.generalScore,
-            topicReasons: classification.reasons,
-            matchedGameTerms: classification.matchedGameTerms,
-            matchedGeneralSignals: classification.matchedGeneralSignals,
-            activeTopic,
-            route,
-            gameContextAttached,
-            classificationLatencyMs,
-          },
-          correction.evaluation,
-        );
-
-        const metrics = this.diagnostics.getMetrics();
-        for (const warning of metrics.warnings) {
-          this.logger.warn('transcript_correction_metric_warning', {
-            sessionId: this.sessionId,
-            warning,
-            totalFinalizedSegments: metrics.totalFinalizedSegments,
-            retranscriptionRate: metrics.retranscriptionRate,
-            averageLowConfidencePathLatencyMs: metrics.averageLowConfidencePathLatencyMs,
-          });
-        }
-
-        if (this.diagnosticsEnabled) {
-          this.logger.debug('transcript_segment_diagnostics', {
-            sessionId: this.sessionId,
-            segmentId: final.segmentId,
-            rawTranscript: correction.rawText,
-            retranscribedTranscript: correction.retranscribedText,
-            correctedTranscript: correction.correctedText,
-            translatedText: translation.translatedText,
-            sttConfidence: final.confidence,
-            wordConfidenceAvailable: wordConfidenceSummary.available,
-            wordConfidenceAvg: wordConfidenceSummary.avg,
-            qualityScore: correction.evaluation.score,
-            qualityReasons: correction.evaluation.reasons,
-            shouldRetranscribe: correction.evaluation.shouldRetranscribe,
-            correctionSource: correction.correctionSource,
-            retranscribeLatencyMs: correction.retranscribeLatencyMs,
-            normalizeLatencyMs: correction.normalizeLatencyMs + routeNormalizeLatencyMs,
-            translationLatencyMs: translation.latencyMs,
-            totalSubtitleLatencyMs,
-            topic: classification.topic,
-            route,
-            topicConfidence: classification.confidence,
-            gameScore: classification.gameScore,
-            generalScore: classification.generalScore,
-            topicReasons: classification.reasons,
-            activeTopic,
-            gameContextAttached,
-          });
-        }
+      if (result.action === 'held' || result.action === 'discarded') {
         return;
       }
-
-      const translation = await this.translateSegment({
-        segmentId: final.segmentId,
-        text: textForTranslation,
-        language: final.language,
-        startMs: final.startMs,
-        endMs: final.endMs,
-      });
-      gameContextAttached = translation.gameContextAttached;
-
-      const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
-      const wordConfidenceSummary = summarizeWordConfidence(
-        final.words,
-        this.correctionConfig.confidenceThreshold,
-      );
-
-      this.diagnostics.record(
-        {
-          segmentId: final.segmentId,
-          rawTranscript: correction.rawText,
-          retranscribedTranscript: correction.retranscribedText,
-          correctedTranscript: correction.correctedText,
-          translatedText: translation.translatedText,
-          sttConfidence: final.confidence,
-          wordConfidenceSummary,
-          qualityScore: correction.evaluation.score,
-          qualityReasons: correction.evaluation.reasons,
-          shouldRetranscribe: correction.evaluation.shouldRetranscribe,
-          correctionSource: correction.correctionSource,
-          retranscribeLatencyMs: correction.retranscribeLatencyMs,
-          normalizeLatencyMs: correction.normalizeLatencyMs,
-          translationLatencyMs: translation.latencyMs,
-          totalSubtitleLatencyMs,
-          timedOut: correction.timedOut,
-          confidenceMissing: typeof final.confidence !== 'number',
-        },
-        correction.evaluation,
-      );
-
-      const metrics = this.diagnostics.getMetrics();
-      for (const warning of metrics.warnings) {
-        this.logger.warn('transcript_correction_metric_warning', {
-          sessionId: this.sessionId,
-          warning,
-          // aggregates only — no transcript text
-          totalFinalizedSegments: metrics.totalFinalizedSegments,
-          retranscriptionRate: metrics.retranscriptionRate,
-          averageLowConfidencePathLatencyMs: metrics.averageLowConfidencePathLatencyMs,
-        });
-      }
-
-      if (this.diagnosticsEnabled) {
-        this.logger.debug('transcript_segment_diagnostics', {
-          sessionId: this.sessionId,
-          segmentId: final.segmentId,
-          rawTranscript: correction.rawText,
-          retranscribedTranscript: correction.retranscribedText,
-          correctedTranscript: correction.correctedText,
-          translatedText: translation.translatedText,
-          sttConfidence: final.confidence,
-          wordConfidenceAvailable: wordConfidenceSummary.available,
-          wordConfidenceAvg: wordConfidenceSummary.avg,
-          qualityScore: correction.evaluation.score,
-          qualityReasons: correction.evaluation.reasons,
-          shouldRetranscribe: correction.evaluation.shouldRetranscribe,
-          correctionSource: correction.correctionSource,
-          retranscribeLatencyMs: correction.retranscribeLatencyMs,
-          normalizeLatencyMs: correction.normalizeLatencyMs,
-          translationLatencyMs: translation.latencyMs,
-          totalSubtitleLatencyMs,
-        });
-      }
+      // If flushed via handleFinalSegment, onAssembled already ran.
     });
 
     this.speech.onError((error) => {
@@ -1144,13 +1301,18 @@ export class TranslationSession {
       gameConfidence: this.resolvedGame?.confidence,
       profileId: this.gameProfile?.id,
       topicRoutingEnabled: this.topicRoutingConfig.enabled,
+      sentenceAssemblyEnabled: this.sentenceAssemblyConfig.enabled,
     });
   }
 
   async stop(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
+    if (this.closed) {
+      this.sentenceAssembly.clear();
+      return;
+    }
     this.started = false;
+    await this.sentenceAssembly.flushThenClear('session-stop');
+    this.closed = true;
     await this.speech.close();
     this.audioBuffer.clear();
     this.transcriptStore.clear();

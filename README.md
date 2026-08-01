@@ -204,22 +204,39 @@ Final STT segment
 
 ### Topic-aware routing
 
-When `TOPIC_ROUTING_ENABLED=true` (default), each finalized segment is classified as game / general / uncertain before translation:
+When `TOPIC_ROUTING_ENABLED=true` (default), each **assembled** utterance is classified as game / general / uncertain before translation (see Sentence assembly below for hold/merge):
 
 ```text
-Final STT
+Assembled utterance
 → quality + optional re-transcription (phonetic normalize skipped)
-→ preliminary topic classify
+→ final topic classify → topicState.update
 → resolve route (game-aware | general | conservative)
 → route-specific normalize
 → optional one refinement classify if text changed and topic was uncertain
-→ route-aware translate → subtitle events (unchanged protocol)
+→ route-aware translate → one translation.final (protocol unchanged)
 ```
 
 - **general** — conversational prompt only; no game terminology, examples, or phonetic aliases (e.g. `serious` stays `serious`).
 - **game-aware** — existing PoE/game profile path with full terminology protection.
 - **conservative** — stream may be in-game but the sentence is ambiguous; match terms only if they appear explicitly.
 - When routing is disabled, behavior matches the previous pipeline (full phonetic normalize + game-aware translate).
+
+### Sentence assembly
+
+When `SENTENCE_ASSEMBLY_ENABLED=true` (default), incomplete STT fragments are held briefly and merged into one utterance before correction and translation:
+
+```text
+Final STT fragment → transcript.final (per fragment)
+→ preliminary topic classify (no topic-state update yet)
+→ hold / merge incomplete fragments (complete sentences flush immediately)
+→ quality eval + optional re-transcription on assembled span
+→ final topic classify → topicState.update → route normalize → one translation.final
+```
+
+- Each STT fragment still emits `transcript.final`; only one `translation.final` is produced per assembled utterance.
+- Complete sentences (terminal punctuation / complete-clause heuristics) do not wait.
+- Game change and session stop flush any pending hold safely, then clear.
+- Hold / merge diagnostics are logged without full transcript text in production.
 
 ### Production `.env` (real path)
 

@@ -47,6 +47,22 @@ export async function buildApp(config: AppConfig) {
       classifierLlmFallbackEnabled: config.TOPIC_CLASSIFIER_LLM_FALLBACK_ENABLED,
       weights: TOPIC_CLASSIFIER_CONFIG,
     },
+    {
+      enabled: config.SENTENCE_ASSEMBLY_ENABLED,
+      holdMinMs: config.SENTENCE_HOLD_MIN_MS,
+      holdDefaultMs: config.SENTENCE_HOLD_DEFAULT_MS,
+      holdUncertainMs: config.SENTENCE_HOLD_UNCERTAIN_MS,
+      holdStrongIncompleteMs: config.SENTENCE_HOLD_STRONG_INCOMPLETE_MS,
+      holdMaxMs: config.SENTENCE_HOLD_MAX_MS,
+      shortGapMs: config.SENTENCE_SHORT_GAP_MS,
+      hardGapMs: config.SENTENCE_HARD_GAP_MS,
+      maxSegments: config.SENTENCE_MAX_SEGMENTS,
+      maxDurationMs: config.SENTENCE_MAX_DURATION_MS,
+      maxWords: config.SENTENCE_MAX_WORDS,
+      maxCharacters: config.SENTENCE_MAX_CHARACTERS,
+      mergeScoreThreshold: config.SENTENCE_MERGE_SCORE_THRESHOLD,
+      diagnosticsEnabled: config.SENTENCE_DIAGNOSTICS_ENABLED,
+    },
   );
 
   const app = Fastify({

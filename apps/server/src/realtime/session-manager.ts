@@ -6,6 +6,7 @@ import type { UsageStore } from '../usage/usage-store.js';
 import { createGameContextService } from '../game-context/game-context.service.js';
 import type { TranscriptCorrectionConfig } from '../transcript-correction/index.js';
 import type { TopicRoutingRuntimeConfig } from '../topic-routing/index.js';
+import type { SentenceAssemblyRuntimeConfig } from '../sentence-assembly/index.js';
 import { TranslationSession } from './translation-session.js';
 
 export class SessionManager {
@@ -23,6 +24,7 @@ export class SessionManager {
     private readonly correction?: TranscriptCorrectionConfig,
     private readonly sampleRate = 16_000,
     private readonly topicRouting?: TopicRoutingRuntimeConfig,
+    private readonly sentenceAssembly?: SentenceAssemblyRuntimeConfig,
   ) {}
 
   getOrCreate(sessionId: string, userId: string, socket: WebSocket): TranslationSession {
@@ -50,6 +52,7 @@ export class SessionManager {
       openaiApiKey: this.openaiApiKey,
       sampleRate: this.sampleRate,
       topicRouting: this.topicRouting,
+      sentenceAssembly: this.sentenceAssembly,
     });
     this.sessions.set(sessionId, session);
     return session;

@@ -52,6 +52,26 @@ const ConfigSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+  SENTENCE_ASSEMBLY_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== 'false'),
+  SENTENCE_HOLD_MIN_MS: z.coerce.number().default(250),
+  SENTENCE_HOLD_DEFAULT_MS: z.coerce.number().default(650),
+  SENTENCE_HOLD_UNCERTAIN_MS: z.coerce.number().default(450),
+  SENTENCE_HOLD_STRONG_INCOMPLETE_MS: z.coerce.number().default(1000),
+  SENTENCE_HOLD_MAX_MS: z.coerce.number().default(1200),
+  SENTENCE_SHORT_GAP_MS: z.coerce.number().default(700),
+  SENTENCE_HARD_GAP_MS: z.coerce.number().default(1500),
+  SENTENCE_MAX_SEGMENTS: z.coerce.number().default(3),
+  SENTENCE_MAX_DURATION_MS: z.coerce.number().default(10_000),
+  SENTENCE_MAX_WORDS: z.coerce.number().default(45),
+  SENTENCE_MAX_CHARACTERS: z.coerce.number().default(280),
+  SENTENCE_MERGE_SCORE_THRESHOLD: z.coerce.number().default(4),
+  SENTENCE_DIAGNOSTICS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
