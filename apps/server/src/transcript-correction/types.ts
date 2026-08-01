@@ -58,6 +58,11 @@ export type CorrectFinalSegmentInput = {
   confidenceThreshold: number;
   retranscribeTimeoutMs: number;
   enabled: boolean;
+  /**
+   * When true, skip game phonetic normalization so the caller can apply
+   * route-specific normalization after topic classification.
+   */
+  skipPhoneticNormalization?: boolean;
 };
 
 export type PhoneticAlias = NonNullable<GameTranslationProfile['phoneticAliases']>[number];

@@ -35,6 +35,18 @@ export type SegmentTranscriptDiagnostics = {
   totalSubtitleLatencyMs: number;
   timedOut: boolean;
   confidenceMissing: boolean;
+  /** Topic routing (when enabled). */
+  topic?: 'game' | 'general' | 'uncertain';
+  topicConfidence?: number;
+  gameScore?: number;
+  generalScore?: number;
+  topicReasons?: string[];
+  matchedGameTerms?: string[];
+  matchedGeneralSignals?: string[];
+  activeTopic?: 'game' | 'general' | 'uncertain';
+  route?: 'game-aware' | 'general' | 'conservative';
+  gameContextAttached?: boolean;
+  classificationLatencyMs?: number;
 };
 
 export type SessionTranscriptMetrics = {
@@ -47,6 +59,13 @@ export type SessionTranscriptMetrics = {
   averageNormalPathLatencyMs: number;
   averageLowConfidencePathLatencyMs: number;
   missingConfidenceSegmentCount: number;
+  gameSegmentCount: number;
+  generalSegmentCount: number;
+  uncertainSegmentCount: number;
+  routeSwitchCount: number;
+  generalToGameSwitchCount: number;
+  gameToGeneralSwitchCount: number;
+  generalRouteGameContextLeakageCount: number;
   warnings: string[];
 };
 
@@ -168,6 +187,29 @@ export class SessionTranscriptDiagnostics {
       warnings.push('stt_confidence_frequently_missing');
     }
 
+    const gameSegmentCount = this.segments.filter((s) => s.topic === 'game').length;
+    const generalSegmentCount = this.segments.filter((s) => s.topic === 'general').length;
+    const uncertainSegmentCount = this.segments.filter((s) => s.topic === 'uncertain').length;
+
+    let routeSwitchCount = 0;
+    let generalToGameSwitchCount = 0;
+    let gameToGeneralSwitchCount = 0;
+    for (let i = 1; i < this.segments.length; i++) {
+      const prev = this.segments[i - 1]?.route;
+      const curr = this.segments[i]?.route;
+      if (!prev || !curr || prev === curr) continue;
+      routeSwitchCount += 1;
+      if (prev === 'general' && (curr === 'game-aware' || curr === 'conservative')) {
+        generalToGameSwitchCount += 1;
+      }
+      if ((prev === 'game-aware' || prev === 'conservative') && curr === 'general') {
+        gameToGeneralSwitchCount += 1;
+      }
+    }
+    const generalRouteGameContextLeakageCount = this.segments.filter(
+      (s) => s.route === 'general' && s.gameContextAttached === true,
+    ).length;
+
     return {
       totalFinalizedSegments: total,
       retranscribedSegmentCount,
@@ -178,6 +220,13 @@ export class SessionTranscriptDiagnostics {
       averageNormalPathLatencyMs,
       averageLowConfidencePathLatencyMs,
       missingConfidenceSegmentCount: this.missingConfidenceCount,
+      gameSegmentCount,
+      generalSegmentCount,
+      uncertainSegmentCount,
+      routeSwitchCount,
+      generalToGameSwitchCount,
+      gameToGeneralSwitchCount,
+      generalRouteGameContextLeakageCount,
       warnings,
     };
   }

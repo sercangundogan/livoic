@@ -101,6 +101,47 @@ export class TranscriptCorrectionService {
       }
     }
 
+    if (input.skipPhoneticNormalization) {
+      const retranscribedDifferent =
+        retranscribed && candidate.length > 0 && candidate !== rawText;
+      const correctedText = retranscribedDifferent ? candidate : undefined;
+      const textForTranslation = candidate;
+      const correctionSource = deriveCorrectionSource({
+        retranscribed,
+        normalized: false,
+        timedOut,
+        hasCorrected: Boolean(correctedText),
+      });
+      this.store.remember({
+        segmentId: input.segmentId,
+        rawText,
+        correctedText,
+        confidence: input.confidence,
+        textForTranslation,
+        retranscribed,
+        normalized: false,
+        timedOut,
+        reasons: [
+          ...evaluation.reasons,
+          ...(timedOut ? ['retranscribe_timeout'] : []),
+          'phonetic_deferred_to_topic_route',
+        ],
+      });
+      return {
+        rawText,
+        retranscribedText,
+        correctedText,
+        textForTranslation,
+        evaluation,
+        retranscribed,
+        normalized: false,
+        timedOut,
+        retranscribeLatencyMs,
+        normalizeLatencyMs: 0,
+        correctionSource,
+      };
+    }
+
     const normalizeStarted = Date.now();
     const normalized = normalizeTranscript(candidate, input.profile);
     const normalizeLatencyMs = Date.now() - normalizeStarted;

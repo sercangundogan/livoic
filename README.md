@@ -202,6 +202,25 @@ Final STT segment
 - PoE example: `serious` is **not** blindly replaced with `Sirus` — only when contextual cues appear (boss, fight, atlas, maven, …). `seriously` is never matched (word boundary).
 - **Normalization is not a provider.** There is no `NORMALIZER_PROVIDER`. `RETRANSCRIBE_PROVIDER=openai` is sufficient for the Whisper hop; phonetic aliases come from the game profile.
 
+### Topic-aware routing
+
+When `TOPIC_ROUTING_ENABLED=true` (default), each finalized segment is classified as game / general / uncertain before translation:
+
+```text
+Final STT
+→ quality + optional re-transcription (phonetic normalize skipped)
+→ preliminary topic classify
+→ resolve route (game-aware | general | conservative)
+→ route-specific normalize
+→ optional one refinement classify if text changed and topic was uncertain
+→ route-aware translate → subtitle events (unchanged protocol)
+```
+
+- **general** — conversational prompt only; no game terminology, examples, or phonetic aliases (e.g. `serious` stays `serious`).
+- **game-aware** — existing PoE/game profile path with full terminology protection.
+- **conservative** — stream may be in-game but the sentence is ambiguous; match terms only if they appear explicitly.
+- When routing is disabled, behavior matches the previous pipeline (full phonetic normalize + game-aware translate).
+
 ### Production `.env` (real path)
 
 ```text

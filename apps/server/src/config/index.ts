@@ -36,6 +36,22 @@ const ConfigSchema = z.object({
   RETRANSCRIBE_TIMEOUT_MS: z.coerce.number().default(2500),
   AUDIO_BUFFER_MAX_SECONDS: z.coerce.number().default(45),
   RETRANSCRIBE_PROVIDER: z.enum(['mock', 'openai', 'none']).default('mock'),
+  TOPIC_ROUTING_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== 'false'),
+  TOPIC_GAME_THRESHOLD: z.coerce.number().default(3),
+  TOPIC_GENERAL_THRESHOLD: z.coerce.number().default(3),
+  TOPIC_MINIMUM_MARGIN: z.coerce.number().default(1.5),
+  TOPIC_GENERAL_SWITCH_SEGMENTS: z.coerce.number().default(2),
+  TOPIC_GAME_SWITCH_SEGMENTS: z.coerce.number().default(1),
+  TOPIC_CONTEXT_GAME_SEGMENTS: z.coerce.number().default(5),
+  TOPIC_CONTEXT_GENERAL_SEGMENTS: z.coerce.number().default(5),
+  TOPIC_CONTEXT_MIXED_SEGMENTS: z.coerce.number().default(3),
+  TOPIC_CLASSIFIER_LLM_FALLBACK_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

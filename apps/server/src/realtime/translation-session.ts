@@ -9,7 +9,7 @@ import type {
 } from '@live-translator/protocol';
 import type { Logger } from '../observability/logger.js';
 import type { SpeechToTextProvider } from '../speech/speech-provider.js';
-import type { TranslationProvider } from '../translation/translation-provider.js';
+import type { TranslationProvider, TranslationInput } from '../translation/translation-provider.js';
 import { ContextManager } from '../translation/context-manager.js';
 import type { UsageStore } from '../usage/usage-store.js';
 import type { GameContextService } from '../game-context/game-context.service.js';
@@ -29,6 +29,22 @@ import {
   type Retranscriber,
   type TranscriptCorrectionConfig,
 } from '../transcript-correction/index.js';
+import {
+  TopicContextHistoryStore,
+  TopicRoutingService,
+  TopicStateManager,
+  RoutedTranslationMemory,
+  assertNoGameContextInGeneralRoute,
+  buildConservativeTranslationPrompt,
+  buildGeneralTranslationPrompt,
+  createTopicClassifier,
+  loadTopicRoutingConfig,
+  normalizeForRoute,
+  type TopicClassificationResult,
+  type TopicRoutingRuntimeConfig,
+  type TranscriptTopic,
+  type TranslationRoute,
+} from '../topic-routing/index.js';
 
 export type TranslationSessionOptions = {
   sessionId: string;
@@ -42,7 +58,10 @@ export type TranslationSessionOptions = {
   correction?: TranscriptCorrectionConfig;
   openaiApiKey?: string;
   sampleRate?: number;
+  topicRouting?: TopicRoutingRuntimeConfig;
 };
+
+const PREVIOUS_TOPIC_SEGMENTS_MAX = 10;
 
 export class TranslationSession {
   readonly sessionId: string;
@@ -61,6 +80,14 @@ export class TranslationSession {
   private readonly correctionService: TranscriptCorrectionService;
   private readonly diagnostics = new SessionTranscriptDiagnostics();
   private readonly diagnosticsEnabled: boolean;
+  private readonly topicRoutingConfig: TopicRoutingRuntimeConfig;
+  private readonly topicClassifier;
+  private readonly topicRouting = new TopicRoutingService();
+  private readonly topicState: TopicStateManager;
+  private readonly topicHistory: TopicContextHistoryStore;
+  private readonly routedMemory = new RoutedTranslationMemory();
+  private previousTopicSegments: Array<{ text: string; topic?: TranscriptTopic }> = [];
+  private generalRouteLeakageCount = 0;
   private audioBuffer: AudioRingBuffer;
   private sampleRate: number;
   private sequence = 0;
@@ -85,6 +112,10 @@ export class TranslationSession {
     this.gameContext = options.gameContext;
     this.memory = options.gameContext.createMemory();
     this.sampleRate = options.sampleRate ?? 16_000;
+    this.topicRoutingConfig = options.topicRouting ?? loadTopicRoutingConfig();
+    this.topicClassifier = createTopicClassifier(this.topicRoutingConfig);
+    this.topicState = new TopicStateManager(this.topicRoutingConfig);
+    this.topicHistory = new TopicContextHistoryStore(this.topicRoutingConfig);
     this.correctionConfig = options.correction ?? {
       enabled: true,
       confidenceThreshold: 0.72,
@@ -189,6 +220,9 @@ export class TranslationSession {
     if (previousGameId && previousGameId !== resolvedGame.gameId) {
       this.memory.clearGameSpecific(true);
       this.context.clear();
+      this.topicState.resetForGameChange();
+      this.topicHistory.clearGame();
+      this.routedMemory.clearGame();
     }
 
     if (emit) {
@@ -223,13 +257,279 @@ export class TranslationSession {
     language?: string;
     startMs?: number;
     endMs?: number;
-  }): Promise<{ translatedText?: string; latencyMs: number }> {
+    route?: TranslationRoute;
+  }): Promise<{
+    translatedText?: string;
+    latencyMs: number;
+    gameContextAttached: boolean;
+  }> {
+    const route = final.route ?? 'game-aware';
+    if (route === 'general') {
+      return this.translateGeneralSegment(final);
+    }
+    if (route === 'conservative') {
+      return this.translateConservativeSegment(final);
+    }
+    return this.translateGameAwareSegment(final);
+  }
+
+  private async translateGeneralSegment(final: {
+    segmentId: string;
+    text: string;
+    language?: string;
+    startMs?: number;
+    endMs?: number;
+  }): Promise<{
+    translatedText?: string;
+    latencyMs: number;
+    gameContextAttached: boolean;
+  }> {
+    const previous = this.topicHistory.getGeneralTexts();
+    const memory = this.routedMemory.general;
+    const prompt = buildGeneralTranslationPrompt(final.text, previous, this.targetLanguage);
+    const translationRequestedAt = Date.now();
+    let gameContextAttached = false;
+
+    const buildCleanInput = (): TranslationInput => ({
+      text: final.text,
+      sourceLanguage: final.language,
+      targetLanguage: this.targetLanguage,
+      previousSegments: previous,
+      platform: this.platform,
+      prompt,
+      domainContext: { type: 'general' },
+    });
+
+    let input = buildCleanInput();
+    try {
+      assertNoGameContextInGeneralRoute(input);
+    } catch (error) {
+      this.generalRouteLeakageCount += 1;
+      if (process.env.NODE_ENV === 'production') {
+        input = buildCleanInput();
+        gameContextAttached = false;
+        this.logger.warn('topic_routing.general_context_leakage_rebuilt', {
+          sessionId: this.sessionId,
+          error: error instanceof Error ? error.message : 'unknown',
+        });
+      } else {
+        throw error;
+      }
+    }
+
+    // Production soft check (assert no-ops when NODE_ENV=production)
+    if (
+      process.env.NODE_ENV === 'production' &&
+      (input.domainContext?.type !== 'general' ||
+        (input.domainContext.terminology?.length ?? 0) > 0 ||
+        (input.domainContext.examples?.length ?? 0) > 0)
+    ) {
+      this.generalRouteLeakageCount += 1;
+      input = buildCleanInput();
+      gameContextAttached = false;
+    }
+
+    try {
+      const result = await this.translation.translate(input);
+      const translatedText = result.translatedText;
+
+      memory.remember({
+        source: final.text,
+        target: translatedText,
+        normalizedSource: final.text.toLowerCase().slice(0, 80),
+        gameId: null,
+        usageCount: 1,
+        lastUsedAt: Date.now(),
+        sourceType: 'provider',
+      });
+
+      this.context.push(final.text);
+      const latencyMs = Date.now() - translationRequestedAt;
+      this.logger.info('game_translation.completed', {
+        sessionId: this.sessionId,
+        route: 'general',
+        matchedTermCount: 0,
+        memoryHitCount: 0,
+        validationPassed: true,
+        retryCount: 0,
+        latencyMs,
+      });
+
+      this.send({
+        type: 'translation.final',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        segmentId: final.segmentId,
+        sourceText: final.text,
+        translatedText,
+        startMs: final.startMs,
+        endMs: final.endMs,
+      });
+      return { translatedText, latencyMs, gameContextAttached };
+    } catch (error) {
+      this.logger.error('translation_failed', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : 'unknown',
+      });
+      this.send({
+        type: 'error',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        code: 'PROVIDER_UNAVAILABLE',
+        message: 'Live translation is temporarily unavailable.',
+        recoverable: true,
+      });
+      return { latencyMs: Date.now() - translationRequestedAt, gameContextAttached };
+    }
+  }
+
+  private async translateConservativeSegment(final: {
+    segmentId: string;
+    text: string;
+    language?: string;
+    startMs?: number;
+    endMs?: number;
+  }): Promise<{
+    translatedText?: string;
+    latencyMs: number;
+    gameContextAttached: boolean;
+  }> {
     const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
     const resolved =
       this.resolvedGame ?? this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
-    const previous = this.context.getPrevious();
+    const previous = this.topicHistory.getMixedTexts();
     const matched = this.gameContext.matchTerms(final.text, profile);
-    const sessionMemory = this.memory.getRelevantEntries(final.text, resolved.gameId);
+    const memory = this.routedMemory.getForRoute('conservative');
+    const sessionMemory = memory.getRelevantEntries(final.text, resolved.gameId);
+    const prompt = buildConservativeTranslationPrompt(
+      final.text,
+      previous,
+      this.targetLanguage,
+      resolved.displayName ?? profile.displayName,
+    );
+    const gameContextAttached = matched.length > 0;
+    const translationRequestedAt = Date.now();
+
+    try {
+      const result = await this.translation.translate({
+        text: final.text,
+        sourceLanguage: final.language,
+        targetLanguage: this.targetLanguage,
+        previousSegments: previous,
+        platform: this.platform,
+        category: this.streamContext?.gameName,
+        prompt,
+        domainContext: {
+          type: 'gaming',
+          name: resolved.displayName ?? profile.displayName,
+          description: 'May be unrelated to the game. Use terms only if explicit.',
+          terminology: matched.slice(0, 12).map((m) => ({
+            source: m.sourceTerm,
+            behavior: m.behavior === 'preserve' ? 'preserve' : 'preferred',
+            target: m.preferredOutput,
+          })),
+          examples: [],
+        },
+      });
+      let translatedText = result.translatedText;
+
+      const validation = this.gameContext.validate({
+        sourceText: final.text,
+        translatedText,
+        matchedTerminology: matched,
+        profile,
+      });
+      translatedText = validation.translatedText;
+
+      for (const match of matched) {
+        if (match.behavior === 'preserve') {
+          memory.remember({
+            source: match.sourceTerm,
+            target: match.sourceTerm,
+            normalizedSource: match.normalizedTerm.toLowerCase(),
+            gameId: resolved.gameId,
+            usageCount: 1,
+            lastUsedAt: Date.now(),
+            sourceType: 'profile',
+          });
+        }
+      }
+      memory.remember({
+        source: final.text,
+        target: translatedText,
+        normalizedSource: final.text.toLowerCase().slice(0, 80),
+        gameId: resolved.gameId,
+        usageCount: 1,
+        lastUsedAt: Date.now(),
+        sourceType: 'provider',
+      });
+
+      this.context.push(final.text);
+      const latencyMs = Date.now() - translationRequestedAt;
+      this.logger.info('game_translation.completed', {
+        sessionId: this.sessionId,
+        gameId: resolved.gameId,
+        route: 'conservative',
+        matchedTermCount: matched.length,
+        memoryHitCount: sessionMemory.length,
+        validationPassed: validation.ok,
+        retryCount: 0,
+        latencyMs,
+      });
+
+      this.send({
+        type: 'translation.final',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        segmentId: final.segmentId,
+        sourceText: final.text,
+        translatedText,
+        startMs: final.startMs,
+        endMs: final.endMs,
+      });
+      return { translatedText, latencyMs, gameContextAttached };
+    } catch (error) {
+      this.logger.error('translation_failed', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : 'unknown',
+      });
+      this.send({
+        type: 'error',
+        sessionId: this.sessionId,
+        sequence: this.nextSequence(),
+        timestamp: Date.now(),
+        code: 'PROVIDER_UNAVAILABLE',
+        message: 'Live translation is temporarily unavailable.',
+        recoverable: true,
+      });
+      return { latencyMs: Date.now() - translationRequestedAt, gameContextAttached };
+    }
+  }
+
+  private async translateGameAwareSegment(final: {
+    segmentId: string;
+    text: string;
+    language?: string;
+    startMs?: number;
+    endMs?: number;
+  }): Promise<{
+    translatedText?: string;
+    latencyMs: number;
+    gameContextAttached: boolean;
+  }> {
+    const routingEnabled = this.topicRoutingConfig.enabled;
+    const profile = this.gameProfile ?? this.gameContext.getTranslationContext().profile;
+    const resolved =
+      this.resolvedGame ?? this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
+    const previous = routingEnabled
+      ? this.topicHistory.getGameTexts()
+      : this.context.getPrevious();
+    const matched = this.gameContext.matchTerms(final.text, profile);
+    const memory = routingEnabled ? this.routedMemory.getForRoute('game-aware') : this.memory;
+    const sessionMemory = memory.getRelevantEntries(final.text, resolved.gameId);
     const { maskedText, termMap } = this.gameContext.protect(final.text, matched);
     const prompt = this.gameContext.buildPrompt({
       currentText: maskedText,
@@ -245,6 +545,7 @@ export class TranslationSession {
     const translationRequestedAt = Date.now();
     let translatedText = '';
     let retryCount = 0;
+    const gameContextAttached = true;
 
     const runProvider = async (stronger = false) => {
       const result = await this.translation.translate({
@@ -312,7 +613,7 @@ export class TranslationSession {
 
       for (const match of matched) {
         if (match.behavior === 'preserve') {
-          this.memory.remember({
+          memory.remember({
             source: match.sourceTerm,
             target: match.sourceTerm,
             normalizedSource: match.normalizedTerm.toLowerCase(),
@@ -323,7 +624,7 @@ export class TranslationSession {
           });
         }
       }
-      this.memory.remember({
+      memory.remember({
         source: final.text,
         target: translatedText,
         normalizedSource: final.text.toLowerCase().slice(0, 80),
@@ -338,6 +639,7 @@ export class TranslationSession {
       this.logger.info('game_translation.completed', {
         sessionId: this.sessionId,
         gameId: resolved.gameId,
+        route: 'game-aware',
         matchedTermCount: matched.length,
         memoryHitCount: sessionMemory.length,
         validationPassed: true,
@@ -356,7 +658,7 @@ export class TranslationSession {
         startMs: final.startMs,
         endMs: final.endMs,
       });
-      return { translatedText, latencyMs };
+      return { translatedText, latencyMs, gameContextAttached };
     } catch (error) {
       this.logger.error('translation_failed', {
         sessionId: this.sessionId,
@@ -371,8 +673,26 @@ export class TranslationSession {
         message: 'Live translation is temporarily unavailable.',
         recoverable: true,
       });
-      return { latencyMs: Date.now() - translationRequestedAt };
+      return { latencyMs: Date.now() - translationRequestedAt, gameContextAttached };
     }
+  }
+
+  private shouldPreferRefinedClassification(
+    preliminary: TopicClassificationResult,
+    refined: TopicClassificationResult,
+  ): boolean {
+    if (refined.topic !== 'game' && refined.topic !== 'general') {
+      return false;
+    }
+    if (preliminary.topic === 'uncertain') {
+      return true;
+    }
+    if (refined.topic === preliminary.topic && refined.confidence <= preliminary.confidence) {
+      return false;
+    }
+    const refinedMargin = Math.abs(refined.gameScore - refined.generalScore);
+    const preliminaryMargin = Math.abs(preliminary.gameScore - preliminary.generalScore);
+    return refined.confidence > preliminary.confidence || refinedMargin > preliminaryMargin;
   }
 
   private async start(event: SessionStartEvent): Promise<void> {
@@ -417,6 +737,7 @@ export class TranslationSession {
     this.speech.onFinal(async (final) => {
       if (!final.text.trim()) return;
       const pipelineStarted = Date.now();
+      const routingEnabled = this.topicRoutingConfig.enabled;
 
       // Emit raw transcript (protocol unchanged)
       this.send({
@@ -450,6 +771,7 @@ export class TranslationSession {
         confidenceThreshold: this.correctionConfig.confidenceThreshold,
         retranscribeTimeoutMs: this.correctionConfig.retranscribeTimeoutMs,
         enabled: this.correctionConfig.enabled,
+        skipPhoneticNormalization: routingEnabled,
       });
 
       this.logger.info('transcript_correction.completed', {
@@ -468,15 +790,227 @@ export class TranslationSession {
         normalizeLatencyMs: correction.normalizeLatencyMs,
         reasonCount: correction.evaluation.reasons.length,
         confidenceMissing: typeof final.confidence !== 'number',
+        skipPhoneticNormalization: routingEnabled,
       });
+
+      let textForTranslation = correction.textForTranslation;
+      let classification: TopicClassificationResult | undefined;
+      let route: TranslationRoute | undefined;
+      let classificationLatencyMs: number | undefined;
+      let gameContextAttached = true;
+      let activeTopic: TranscriptTopic | undefined;
+      let routeNormalizeLatencyMs = 0;
+
+      if (routingEnabled) {
+        const classifyStarted = Date.now();
+        const usableText = correction.textForTranslation;
+        const resolved =
+          this.resolvedGame ??
+          this.gameContext.getTranslationContext(this.streamContext).resolvedGame;
+
+        const preliminary = this.topicClassifier.classify({
+          currentText: usableText,
+          previousSegments: this.previousTopicSegments,
+          streamContext: this.streamContext
+            ? {
+                gameName: this.streamContext.gameName,
+                streamTitle: this.streamContext.streamTitle,
+                channelName: this.streamContext.channelName,
+              }
+            : undefined,
+          gameContext: {
+            gameId: resolved.gameId,
+            displayName: resolved.displayName,
+            confidence: resolved.confidence,
+          },
+          gameProfile: profile,
+          activeTopicState: this.topicState.getState(),
+        });
+
+        this.topicState.update(preliminary);
+        route = this.topicRouting.resolveRoute(preliminary, this.topicState.getState());
+
+        let normalized = normalizeForRoute(usableText, route, profile);
+        routeNormalizeLatencyMs = normalized.normalizeLatencyMs;
+        classification = preliminary;
+
+        if (preliminary.topic === 'uncertain' && normalized.text !== usableText) {
+          const refined = this.topicClassifier.classify({
+            currentText: normalized.text,
+            correctedText: normalized.text,
+            previousSegments: this.previousTopicSegments,
+            streamContext: this.streamContext
+              ? {
+                  gameName: this.streamContext.gameName,
+                  streamTitle: this.streamContext.streamTitle,
+                  channelName: this.streamContext.channelName,
+                }
+              : undefined,
+            gameContext: {
+              gameId: resolved.gameId,
+              displayName: resolved.displayName,
+              confidence: resolved.confidence,
+            },
+            gameProfile: profile,
+            activeTopicState: this.topicState.getState(),
+          });
+
+          if (this.shouldPreferRefinedClassification(preliminary, refined)) {
+            this.topicState.update(refined);
+            const refinedRoute = this.topicRouting.resolveRoute(
+              refined,
+              this.topicState.getState(),
+            );
+            classification = refined;
+            if (refinedRoute !== route) {
+              route = refinedRoute;
+              normalized = normalizeForRoute(usableText, route, profile);
+              routeNormalizeLatencyMs += normalized.normalizeLatencyMs;
+            }
+          }
+        }
+
+        textForTranslation = normalized.text;
+        classificationLatencyMs = Date.now() - classifyStarted;
+        activeTopic = this.topicState.getState().currentTopic;
+
+        const translation = await this.translateSegment({
+          segmentId: final.segmentId,
+          text: textForTranslation,
+          language: final.language,
+          startMs: final.startMs,
+          endMs: final.endMs,
+          route,
+        });
+        gameContextAttached = translation.gameContextAttached;
+
+        const topicForHistory: TranscriptTopic =
+          classification.topic === 'uncertain'
+            ? this.topicState.inheritTopicForUncertain(classification)
+            : classification.topic;
+
+        this.topicHistory.push({
+          text: textForTranslation,
+          topic: topicForHistory,
+          route,
+          at: Date.now(),
+        });
+        this.previousTopicSegments.push({
+          text: textForTranslation,
+          topic: classification.topic,
+        });
+        if (this.previousTopicSegments.length > PREVIOUS_TOPIC_SEGMENTS_MAX) {
+          this.previousTopicSegments.shift();
+        }
+
+        this.logger.info('topic_routing.completed', {
+          sessionId: this.sessionId,
+          segmentId: final.segmentId,
+          topic: classification.topic,
+          route,
+          confidence: classification.confidence,
+          gameScore: classification.gameScore,
+          generalScore: classification.generalScore,
+          reasons: classification.reasons,
+          matchedGameTermCount: classification.matchedGameTerms.length,
+          matchedGeneralSignalCount: classification.matchedGeneralSignals.length,
+          activeTopic,
+          gameContextAttached,
+          generalRouteLeakageCount: this.generalRouteLeakageCount,
+          latencyMs: classificationLatencyMs,
+        });
+
+        const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
+        const wordConfidenceSummary = summarizeWordConfidence(
+          final.words,
+          this.correctionConfig.confidenceThreshold,
+        );
+
+        this.diagnostics.record(
+          {
+            segmentId: final.segmentId,
+            rawTranscript: correction.rawText,
+            retranscribedTranscript: correction.retranscribedText,
+            correctedTranscript: correction.correctedText,
+            translatedText: translation.translatedText,
+            sttConfidence: final.confidence,
+            wordConfidenceSummary,
+            qualityScore: correction.evaluation.score,
+            qualityReasons: correction.evaluation.reasons,
+            shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+            correctionSource: correction.correctionSource,
+            retranscribeLatencyMs: correction.retranscribeLatencyMs,
+            normalizeLatencyMs: correction.normalizeLatencyMs + routeNormalizeLatencyMs,
+            translationLatencyMs: translation.latencyMs,
+            totalSubtitleLatencyMs,
+            timedOut: correction.timedOut,
+            confidenceMissing: typeof final.confidence !== 'number',
+            topic: classification.topic,
+            topicConfidence: classification.confidence,
+            gameScore: classification.gameScore,
+            generalScore: classification.generalScore,
+            topicReasons: classification.reasons,
+            matchedGameTerms: classification.matchedGameTerms,
+            matchedGeneralSignals: classification.matchedGeneralSignals,
+            activeTopic,
+            route,
+            gameContextAttached,
+            classificationLatencyMs,
+          },
+          correction.evaluation,
+        );
+
+        const metrics = this.diagnostics.getMetrics();
+        for (const warning of metrics.warnings) {
+          this.logger.warn('transcript_correction_metric_warning', {
+            sessionId: this.sessionId,
+            warning,
+            totalFinalizedSegments: metrics.totalFinalizedSegments,
+            retranscriptionRate: metrics.retranscriptionRate,
+            averageLowConfidencePathLatencyMs: metrics.averageLowConfidencePathLatencyMs,
+          });
+        }
+
+        if (this.diagnosticsEnabled) {
+          this.logger.debug('transcript_segment_diagnostics', {
+            sessionId: this.sessionId,
+            segmentId: final.segmentId,
+            rawTranscript: correction.rawText,
+            retranscribedTranscript: correction.retranscribedText,
+            correctedTranscript: correction.correctedText,
+            translatedText: translation.translatedText,
+            sttConfidence: final.confidence,
+            wordConfidenceAvailable: wordConfidenceSummary.available,
+            wordConfidenceAvg: wordConfidenceSummary.avg,
+            qualityScore: correction.evaluation.score,
+            qualityReasons: correction.evaluation.reasons,
+            shouldRetranscribe: correction.evaluation.shouldRetranscribe,
+            correctionSource: correction.correctionSource,
+            retranscribeLatencyMs: correction.retranscribeLatencyMs,
+            normalizeLatencyMs: correction.normalizeLatencyMs + routeNormalizeLatencyMs,
+            translationLatencyMs: translation.latencyMs,
+            totalSubtitleLatencyMs,
+            topic: classification.topic,
+            route,
+            topicConfidence: classification.confidence,
+            gameScore: classification.gameScore,
+            generalScore: classification.generalScore,
+            topicReasons: classification.reasons,
+            activeTopic,
+            gameContextAttached,
+          });
+        }
+        return;
+      }
 
       const translation = await this.translateSegment({
         segmentId: final.segmentId,
-        text: correction.textForTranslation,
+        text: textForTranslation,
         language: final.language,
         startMs: final.startMs,
         endMs: final.endMs,
       });
+      gameContextAttached = translation.gameContextAttached;
 
       const totalSubtitleLatencyMs = Date.now() - pipelineStarted;
       const wordConfidenceSummary = summarizeWordConfidence(
@@ -609,6 +1143,7 @@ export class TranslationSession {
       gameId: this.resolvedGame?.gameId,
       gameConfidence: this.resolvedGame?.confidence,
       profileId: this.gameProfile?.id,
+      topicRoutingEnabled: this.topicRoutingConfig.enabled,
     });
   }
 
@@ -623,10 +1158,16 @@ export class TranslationSession {
     this.logger.info('session_transcript_metrics', {
       sessionId: this.sessionId,
       ...metrics,
+      generalRouteLeakageCount: this.generalRouteLeakageCount,
     });
     this.diagnostics.clear();
     this.usage.end(this.sessionId);
     this.memory.clearSession();
+    this.topicState.clear();
+    this.topicHistory.clear();
+    this.routedMemory.clearSession();
+    this.previousTopicSegments = [];
+    this.generalRouteLeakageCount = 0;
     this.send({
       type: 'session.status',
       sessionId: this.sessionId,

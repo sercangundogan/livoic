@@ -5,6 +5,7 @@ import { createTranslationProvider } from '../translation/mock-translation-provi
 import type { UsageStore } from '../usage/usage-store.js';
 import { createGameContextService } from '../game-context/game-context.service.js';
 import type { TranscriptCorrectionConfig } from '../transcript-correction/index.js';
+import type { TopicRoutingRuntimeConfig } from '../topic-routing/index.js';
 import { TranslationSession } from './translation-session.js';
 
 export class SessionManager {
@@ -21,6 +22,7 @@ export class SessionManager {
     private readonly deepgramModel?: string,
     private readonly correction?: TranscriptCorrectionConfig,
     private readonly sampleRate = 16_000,
+    private readonly topicRouting?: TopicRoutingRuntimeConfig,
   ) {}
 
   getOrCreate(sessionId: string, userId: string, socket: WebSocket): TranslationSession {
@@ -47,6 +49,7 @@ export class SessionManager {
       correction: this.correction,
       openaiApiKey: this.openaiApiKey,
       sampleRate: this.sampleRate,
+      topicRouting: this.topicRouting,
     });
     this.sessions.set(sessionId, session);
     return session;

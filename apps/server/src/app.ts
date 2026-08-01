@@ -13,6 +13,7 @@ import {
   estimateAudioBufferBytes,
   logProductionReadiness,
 } from './transcript-correction/index.js';
+import { TOPIC_CLASSIFIER_CONFIG } from './topic-routing/index.js';
 
 export async function buildApp(config: AppConfig) {
   const logger = createLogger(config.LOG_LEVEL);
@@ -33,6 +34,19 @@ export async function buildApp(config: AppConfig) {
       retranscribeProvider: config.RETRANSCRIBE_PROVIDER,
     },
     config.AUDIO_SAMPLE_RATE,
+    {
+      enabled: config.TOPIC_ROUTING_ENABLED,
+      gameThreshold: config.TOPIC_GAME_THRESHOLD,
+      generalThreshold: config.TOPIC_GENERAL_THRESHOLD,
+      minimumMargin: config.TOPIC_MINIMUM_MARGIN,
+      generalSwitchSegments: config.TOPIC_GENERAL_SWITCH_SEGMENTS,
+      gameSwitchSegments: config.TOPIC_GAME_SWITCH_SEGMENTS,
+      contextGameSegments: config.TOPIC_CONTEXT_GAME_SEGMENTS,
+      contextGeneralSegments: config.TOPIC_CONTEXT_GENERAL_SEGMENTS,
+      contextMixedSegments: config.TOPIC_CONTEXT_MIXED_SEGMENTS,
+      classifierLlmFallbackEnabled: config.TOPIC_CLASSIFIER_LLM_FALLBACK_ENABLED,
+      weights: TOPIC_CLASSIFIER_CONFIG,
+    },
   );
 
   const app = Fastify({
